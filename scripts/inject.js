@@ -1164,6 +1164,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     for (var ni = 0; ni < nav.length; ni++) nav[ni].remove();
     var ss = document.querySelectorAll('#wbs-style');
     for (var j = 0; j < ss.length; j++) ss[j].remove();
+    if (document.documentElement) document.documentElement.removeAttribute('data-wbs-message-nav');
     var dbg = document.querySelectorAll('#wbs-diag-badge, #wbs-debug-panel');
     for (var k = 0; k < dbg.length; k++) dbg[k].remove();
     // [CodeBuddy IDE 状态栏] 清理 IDE 模式注入的浮层 root 与原生菜单去重样式，确保 reinjection 幂等
@@ -4548,19 +4549,13 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       } catch (e) {}
     }
 
-    // WorkBuddy 自带的会话历史索引使用稳定的 aside class，但父级 teams 布局会变化。
-    // 开启 WorkDaddy 消息索引时移除官方导航，避免两套索引重叠；body observer 会在官方重建后再次清理。
-    function removeOfficialConversationHistoryNavigation(enabled) {
-      if (!enabled || typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return 0;
-      var removed = 0;
-      var nodes;
-      try { nodes = document.querySelectorAll('aside.conversation-history-navigation'); } catch (_) { return 0; }
-      for (var i = 0; i < nodes.length; i++) {
-        try {
-          if (nodes[i] && typeof nodes[i].remove === 'function') { nodes[i].remove(); removed++; }
-        } catch (_) {}
-      }
-      return removed;
+    // 官方导航由 React 管理，直接删除会让切会话时的卸载抛出 removeChild NotFoundError。
+    // 只通过 CSS 隐藏，保留父子关系；新建的导航自动匹配，关闭开关或销毁注入时恢复。
+    function setOfficialConversationHistoryNavigationHidden(hidden) {
+      var html = document.documentElement;
+      if (!html) return;
+      if (hidden) html.setAttribute('data-wbs-message-nav', '');
+      else html.removeAttribute('data-wbs-message-nav');
     }
 
     // 会话消息导航：完整索引来自 controller.messageStore，DOM 仅用于判断当前可见位置。
@@ -5010,8 +5005,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }
 
       function setEnabled(enabled) {
+        setOfficialConversationHistoryNavigationHidden(enabled);
         if (enabled) {
-          removeOfficialConversationHistoryNavigation(true);
           sync();
           return;
         }
@@ -5166,9 +5161,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
       listen(window, 'resize', onWindowChange);
       listen(window, 'scroll', onWindowChange, true);
-      removeOfficialConversationHistoryNavigation(sessState.messageNav);
+      setOfficialConversationHistoryNavigationHidden(sessState.messageNav);
       sync();
       registerDisposer(function () {
+        setOfficialConversationHistoryNavigationHidden(false);
         disposed = true;
         if (syncTimer) clearTimeout(syncTimer);
         if (tooltipTimer) clearTimeout(tooltipTimer);
@@ -5316,7 +5312,6 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function onDomChange() {
       if (!alive) return;
       guardSessionChange();
-      removeOfficialConversationHistoryNavigation(sessState.messageNav);
       if (messageNavigation) messageNavigation.sync();
       scheduleForkButtons();
       scheduleFabPos();
@@ -17763,6 +17758,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     'html.cb-dark .wbs-fork-button,html[data-theme="dark"] .wbs-fork-button,body[data-vscode-theme-name*="dark" i] .wbs-fork-button{color:var(--wb-icon-secondary,rgba(255,255,255,.7))}',
     'html.cb-dark .wbs-fork-button:hover,html[data-theme="dark"] .wbs-fork-button:hover,body[data-vscode-theme-name*="dark" i] .wbs-fork-button:hover{color:var(--wb-color-text-primary,#f2f3f5);background:var(--wb-bg-hover,rgba(255,255,255,.1))}',
     /* 会话消息索引：跟随官方消息视口定位，tooltip 使用主题感知的毛玻璃表面 */
+    'html[data-wbs-message-nav] aside.conversation-history-navigation{display:none!important}',
     '.wbs-message-nav-root{position:fixed;width:24px;z-index:1000;pointer-events:none;user-select:none;-webkit-user-select:none;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-message-nav-rail{display:flex;width:24px;height:100%;box-sizing:border-box;flex-direction:column;align-items:center;justify-content:flex-start;gap:0;overflow:hidden;padding:6px 0;border:1px solid transparent;border-radius:8px;background:color-mix(in srgb,var(--wb-bg-popover,#fff) 16%,transparent);box-shadow:none;backdrop-filter:none;-webkit-backdrop-filter:none;pointer-events:auto;touch-action:none;cursor:pointer;scrollbar-width:none;transition:background-color .18s ease,border-color .18s ease,box-shadow .18s ease,backdrop-filter .18s ease}',
     '.wbs-message-nav-rail:hover,.wbs-message-nav-rail:focus-within{border-color:color-mix(in srgb,var(--wb-border-subtle,#d9dadd) 72%,transparent);background:color-mix(in srgb,var(--wb-bg-popover,#fff) 48%,transparent);box-shadow:0 5px 18px rgba(24,28,36,.10);backdrop-filter:blur(14px) saturate(1.12);-webkit-backdrop-filter:blur(14px) saturate(1.12)}',
