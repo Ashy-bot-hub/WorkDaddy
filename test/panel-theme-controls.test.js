@@ -44,9 +44,9 @@ test('theme choices do not activate official data-theme scopes and robot radios 
   assert.match(pane, /value="default"/);
 });
 
-test('theme pane restores five radio choices and enabling takeover restores the saved theme', () => {
+test('theme pane restores six radio choices and enabling takeover restores the saved theme', () => {
   const pane = section('function buildThemePane()', 'function buildEnhancePane()');
-  for (const id of ['default', 'dark', 'eye-care', 'cyber-purple', 'nebula']) {
+  for (const id of ['system', 'default', 'dark', 'eye-care', 'cyber-purple', 'nebula']) {
     assert.ok(pane.includes('name="wbs-theme" value="' + id + '"'));
   }
   assert.match(pane, /<div class="wbs-pcard-title">接管主题<\/div>/);
@@ -153,6 +153,9 @@ test('glass composer triggers receive an inline transparent background after tea
   assert.match(source, /node\.style\.setProperty\('background', 'transparent', 'important'\)/);
   assert.match(source, /node\.style\.setProperty\('background-color', 'transparent', 'important'\)/);
   assert.match(source, /\.cr-context-usage-tooltip-trigger/);
+  const triggerSync = section('function syncGlassComposerTriggerBackgrounds()', 'function onInputSync()');
+  assert.ok(triggerSync.includes('.cr-input-toolbar__right > span.cr-voice-trigger-wrap > span.cr-voice-trigger-tooltip'),
+    'nested voice trigger receives the inline override after remounts');
   assert.match(source, /glassThemeObserver\.observe\(document\.documentElement/);
   assert.match(source, /\.wbs-account-note-footer \.primary:disabled\{background:rgba\(255,255,255,\.78\) !important[^}]*color:#34343c !important/);
 });
@@ -260,6 +263,7 @@ for (const trigger of ['switch', 'settings refresh']) test('frosted wallpaper st
   const requests = [];
   let resolveWallpapers;
   const context = {
+    alive: true, registerDisposer() {}, loadWallpaperRotation() {},
     CAPS: {}, currentThemeId: 'nebula', sessState: {}, enhancePane: null, conversationUsageEnabled: false,
     themePane: { querySelector: selector => nodes[selector] || null, querySelectorAll: () => [card] },
     root: { querySelector: selector => nodes[selector] || null },
@@ -275,7 +279,7 @@ for (const trigger of ['switch', 'settings refresh']) test('frosted wallpaper st
   };
   vm.runInNewContext(section('function applySessionModule(', '    /** 增强页快捷短语列表') +
     section('function syncWallpaperCardVisibility(', '    // 主题 pane 事件绑定') +
-    section('function loadWallpapers(force)', '    function setOpen('), context);
+    section('    var wallpaperPreviewUrls =', '    function setOpen('), context);
   context.applySessionModule({ ok: true, themeTakeoverEnabled: false });
   context.syncWallpaperCardVisibility('nebula'); // First visit with takeover off.
   assert.equal(requests.length, 0);
@@ -315,12 +319,16 @@ test('primary actions use native button tokens in every interaction state', () =
   assert.match(glass, /\.wbs-status-popover/);
 });
 
-for (const nativeComposer of [false, true]) test('theme controls are rendered only for WorkBuddy: nativeComposer=' + nativeComposer, () => {
+for (const nativeComposer of [false, true]) test('theme controls match the client theme capability: nativeComposer=' + nativeComposer, () => {
   const context = { CAPS: {nativeComposer}, WBS_BRAND: 'WorkDaddy', themePane: {dataset:{}}, wireThemePane() {}, applyAvatar() {} };
   vm.runInNewContext(section('function buildThemePane()', '    // 增强 pane'), context);
   context.buildThemePane();
-  assert.equal((context.themePane.innerHTML.match(/name="wbs-theme"/g) || []).length, nativeComposer ? 0 : 5);
+  assert.equal((context.themePane.innerHTML.match(/name="wbs-theme"/g) || []).length, nativeComposer ? 3 : 6);
   assert.equal(context.themePane.innerHTML.includes('接管主题'), !nativeComposer);
+  if (nativeComposer) {
+    assert.match(context.themePane.innerHTML, /id="wbs-native-theme-card"/);
+    assert.doesNotMatch(context.themePane.innerHTML, /value="(?:eye-care|cyber-purple|nebula)"/);
+  }
 });
 
 test('rapid theme selections ignore stale failures and disabled takeover prevents writes', async () => {
@@ -343,15 +351,106 @@ test('rapid theme selections ignore stale failures and disabled takeover prevent
   assert.equal(requests.length, 2);
 });
 
+test('CodeBuddy theme choices use native system/light/dark mode without takeover', async () => {
+  const requests = [];
+  const context = {
+    CAPS: { nativeComposer: true, themeTakeover: false },
+    sessState: { themeTakeover: false }, themePane: null, root: {},
+    syncWallpaperCardVisibility() {}, toast() {},
+    api: (route, options) => new Promise((resolve, reject) => requests.push({ route, options, resolve, reject })),
+  };
+  vm.runInNewContext(section('    var ALLOWED_THEMES =', '    // 页面主题由 daemon'), context);
+  const pending = context.selectTheme('dark');
+  assert.equal(requests.length, 1);
+  assert.equal(JSON.parse(requests[0].options.body).nativeOnly, true);
+  requests[0].resolve({ ok: true });
+  await pending;
+  await context.selectTheme('nebula');
+  const system = context.selectTheme('system');
+  assert.equal(requests.length, 2);
+  assert.deepEqual(JSON.parse(requests[1].options.body), { id: 'system', nativeOnly: true });
+  requests[1].resolve({ ok: true, resolved: 'default' }); await system;
+  assert.equal(context.currentThemeId, 'system');
+});
+
+test('daemon accepts nativeOnly only for CodeBuddy official modes', () => {
+  assert.match(daemon, /const nativeOnly = body\.nativeOnly === true && PROFILE\.capabilities\.nativeComposer/);
+  assert.match(daemon, /const applyOptions = nativeOnly \? \{ nativeOnly: true \} : null/);
+  assert.match(daemon, /applyOptions \? applyThemeByCdp\(id, applyOptions\) : applyThemeByCdp\(id\)/);
+  assert.match(daemon, /if \(nativeOnly && id !== 'default' && id !== 'dark' && id !== 'system'\)/);
+});
+
+test('theme apply route responds and persists native theme selections and handles failures', async () => {
+  const start = daemon.indexOf("  if (req.method === 'POST' && p === '/api/theme-apply') {");
+  const end = daemon.indexOf('\n  // 保存自定义主题', start);
+  const route = vm.runInNewContext('(async function (req, res, p) {' + daemon.slice(start, end) + '})', {
+    readBody: async req => req.body,
+    themeApplyGeneration: 0, readSavedThemeId: () => 'default',
+    PROFILE: { capabilities: { nativeComposer: true } },
+    getTheme: () => ({}),
+    applyThemeByCdp: async (id, options) => {
+      if (id === 'default') throw new Error('CDP unavailable');
+      assert.equal(options.nativeOnly, true);
+      return { ok: true };
+    },
+    fs: { writeFileSync: (file, data) => saved.push(JSON.parse(data)) },
+    path, DATA_DIR: '/synthetic',
+    json: (res, status, body) => { res.status = status; res.body = body; },
+    log() {},
+  });
+  const saved = [];
+  const success = {};
+  await route({ method: 'POST', body: { id: 'dark', nativeOnly: true } }, success, '/api/theme-apply');
+  assert.equal(success.status, 200);
+  assert.equal(success.body.id, 'dark');
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].id, 'dark');
+  const system = {};
+  await route({ method: 'POST', body: { id: 'system', nativeOnly: true } }, system, '/api/theme-apply');
+  assert.equal(system.status, 200);
+  assert.equal(saved[1].id, 'system');
+  const failure = {};
+  await route({ method: 'POST', body: { id: 'default', nativeOnly: true } }, failure, '/api/theme-apply');
+  assert.equal(failure.status, 500);
+  assert.equal(saved.length, 2);
+});
+
+test('follow system persists the system mode and reports the resolved appearance', async () => {
+  const requests = [], notices = [];
+  const context = {
+    CAPS: {}, sessState: {themeTakeover:true}, themePane:null, root:{},
+    syncWallpaperCardVisibility() {}, toast: message => notices.push(message),
+    api: (route, options) => { requests.push({route, options}); return Promise.resolve({ok:true, resolved:'dark'}); },
+  };
+  vm.runInNewContext(section('    var ALLOWED_THEMES =', '    // 页面主题由 daemon'), context);
+  await context.selectTheme('system');
+  assert.equal(context.currentThemeId, 'system');
+  assert.deepEqual(requests.map(r=>JSON.parse(r.options.body).id), ['system']);
+  assert.match(notices[0], /深色/);
+  // 壁纸目标在「跟随系统」下与浅色/深色一致：不会把 system 当作自定义主题目录
+  assert.equal(context.themeSelectValue(), 'nebula');
+});
+
 test('wallpaper controls are exclusive to the selected frosted theme', () => {
   const wallpaper = {style:{}}, shadow = {style:{}};
   let loads=0;
-  const context = {sessState:{themeTakeover:true}, loadWallpapers:()=>loads++, themePane:{querySelector: selector => selector==='#wbs-wallpaper-card'?wallpaper:shadow}};
+  const context = {sessState:{themeTakeover:true}, loadWallpaperRotation() {}, loadWallpapers:()=>loads++, themePane:{querySelector: selector => selector==='#wbs-wallpaper-card'?wallpaper:shadow}};
   vm.runInNewContext(section('function syncWallpaperCardVisibility(', '    // 关闭接管后'),context);
-  for(const id of ['default','dark','eye-care','cyber-purple','nebula']) {
+  for(const id of ['system','default','dark','eye-care','cyber-purple','nebula']) {
     context.syncWallpaperCardVisibility(id);
     assert.equal(wallpaper.style.display, id==='nebula'?'':'none');
     assert.equal(shadow.style.display, wallpaper.style.display);
   }
   assert.equal(loads,1);
+});
+
+for (const nativeMode of ['default', 'dark']) test('CodeBuddy reopens the saved system selection over native ' + nativeMode, async () => {
+  const context = {
+    CAPS: { nativeComposer: true }, themePane: null,
+    document: { documentElement: { getAttribute: () => nativeMode === 'dark' ? 'dark' : 'light', classList: { contains: () => false } }, body: { getAttribute: () => '' } },
+    syncWallpaperCardVisibility() {}, api: async () => ({ current: 'system' }),
+  };
+  vm.runInNewContext(section('    var ALLOWED_THEMES =', '    // 页面主题由 daemon'), context);
+  await context.loadThemes();
+  assert.equal(context.currentThemeId, 'system');
 });

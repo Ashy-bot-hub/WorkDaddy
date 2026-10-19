@@ -395,23 +395,31 @@ function normalizeAutoContinueError(error) {
   var details = terminal.details && typeof terminal.details === 'object' ? terminal.details : {};
   function numberValue() {
     for (var i = 0; i < arguments.length; i++) {
+      if (arguments[i] === null || arguments[i] === undefined || arguments[i] === '' || typeof arguments[i] === 'boolean') continue;
       var n = Number(arguments[i]);
       if (Number.isSafeInteger(n)) return n;
     }
     return null;
   }
-  var code = numberValue(error.code, error.bizCode, terminal.bizCode, details.code);
+  // The official cap banner gives terminal.bizCode=6004 precedence over the
+  // outer transport code (including 0/500), so statistics must do the same.
+  var code = Number(terminal.bizCode) === 6004 ? 6004 : numberValue(error.code, error.bizCode, terminal.bizCode, details.code);
   var statusCode = numberValue(error.statusCode, error.status, error.httpStatus);
   var requestModelId = String(error.requestModelId || error.modelId || details.requestModelId || '').slice(0, 160);
   var category = String(error.category || error.type || details.category || '').slice(0, 80).toLowerCase();
   var message = String(error.message || terminal.message || details.message || '').slice(0, 240);
+  // WorkBuddy 5.8's terminal.details is text, and may contain the only reset
+  // date. Match its banner's reset source without retaining provider text.
+  var resetTextSource = [terminal.details, terminal.message, error.message].filter(function (value) {
+    return typeof value === 'string';
+  }).map(function (value) { return value.slice(0, 4096); }).join(' ');
   var rateLimited = code === 6004 || statusCode === 429 || /rate.?limit|频率|限流/i.test(category + ' ' + message);
   var quotaExhausted = code === 14018 || code === 14012 || code === 14014 || code === 14019 || /quota|credit|额度|积分|余额/i.test(category + ' ' + message);
   var authFailure = statusCode === 401 || statusCode === 403 || /auth|credential|登录|认证/i.test(category + ' ' + message);
   var resetAt = null;
   var resetSource = details.resetAt || details.reset_at || terminal.resetAt || error.resetAt;
   if (resetSource === undefined || resetSource === null || resetSource === '') {
-    var resetMatch = /(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\s+UTC[+-]\d{1,2})?)/i.exec(message);
+    var resetMatch = /(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\s*\(?UTC[+-]\d{1,2}\)?)?)/i.exec(resetTextSource);
     if (resetMatch) resetSource = resetMatch[1];
   }
   if (resetSource !== undefined && resetSource !== null && resetSource !== '') {
@@ -419,7 +427,10 @@ function normalizeAutoContinueError(error) {
     if (Number.isFinite(resetNumber)) resetAt = resetNumber < 1e12 ? Math.round(resetNumber * 1000) : Math.round(resetNumber);
     else {
       var resetText = String(resetSource).trim();
-      var parsed = Date.parse(resetText.replace(' UTC+8', '+08:00').replace(' UTC+0800', '+08:00').replace(' ', 'T'));
+      resetText = resetText.replace(/\s*\(?UTC\+0?8(?:00)?\)?$/i, '+08:00').replace(' ', 'T');
+      // Official cap dates are Shanghai wall clock, even on non-China hosts.
+      if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(resetText)) resetText += '+08:00';
+      var parsed = Date.parse(resetText);
       if (Number.isFinite(parsed)) resetAt = parsed;
     }
   }
@@ -435,6 +446,68 @@ function normalizeAutoContinueError(error) {
     nonRetryable: rateLimited || quotaExhausted || authFailure || AUTO_CONTINUE_QUOTA_CODES[code] === true,
     terminal: terminal === error.terminal || terminal.isTerminal === true,
   };
+}
+
+// Cap statistics have their own read-only subscription. Auto-continue may be
+// disabled or detach a finished reply before its terminal error arrives.
+function createModelRateLimitObserver(options) {
+  var bindings = new Map();
+  var alive = true;
+  function inspect(controller, binding) {
+    if (!alive) return;
+    try {
+      var state = controller.sessionStore.getState() || {};
+      [state.error, state.warning].forEach(function (error) {
+        var normalized = normalizeAutoContinueError(error);
+        if (!normalized || normalized.code !== 6004) return;
+        var modelId = normalized.requestModelId || String(state.model || state.modelId || '');
+        if (!modelId) return;
+        binding.latest = {
+          conversationId: String(controller.conversationId || ''),
+          assistantId: String(error.requestId || ''),
+          rateLimited: true,
+          errorCode: 6004,
+          errorRequestModelId: modelId,
+          errorModelName: modelId,
+          errorResetAt: normalized.resetAt,
+        };
+      });
+      // Keep the sanitized cap after WorkBuddy clears a transient error, so a
+      // temporary local API failure can retry on the next discovery heartbeat.
+      if (binding.latest) options.record(binding.latest);
+    } catch (_) {}
+  }
+  function refresh() {
+    if (!alive) return;
+    var controllers;
+    try { controllers = options.discover() || []; } catch (_) { return; }
+    var seen = new Set(controllers);
+    bindings.forEach(function (binding, controller) {
+      if (seen.has(controller)) return;
+      try { if (binding.unsubscribe) binding.unsubscribe(); } catch (_) {}
+      bindings.delete(controller);
+    });
+    controllers.forEach(function (controller) {
+      if (!controller || !controller.sessionStore || typeof controller.sessionStore.getState !== 'function') return;
+      var binding = bindings.get(controller);
+      if (!binding) {
+        binding = {};
+        bindings.set(controller, binding);
+        try {
+          binding.unsubscribe = controller.sessionStore.subscribe(function () { inspect(controller, binding); });
+        } catch (_) {}
+      }
+      inspect(controller, binding);
+    });
+  }
+  refresh();
+  var timer = options.setInterval(refresh, 5000);
+  return { refresh: refresh, destroy: function () {
+    alive = false;
+    options.clearInterval(timer);
+    bindings.forEach(function (binding) { try { if (binding.unsubscribe) binding.unsubscribe(); } catch (_) {} });
+    bindings.clear();
+  } };
 }
 
 function classifyAutoContinueError(error) {
@@ -1014,6 +1087,7 @@ if (typeof module !== 'undefined' && module.exports) {
     classifySessionHealth: classifySessionHealth,
     classifyAutoContinueReply: classifyAutoContinueReply,
     normalizeAutoContinueError: normalizeAutoContinueError,
+    createModelRateLimitObserver: createModelRateLimitObserver,
     classifyAutoContinueError: classifyAutoContinueError,
     classifyAutoContinueControllerSnapshot: classifyAutoContinueControllerSnapshot,
     autoContinueMessageText: autoContinueMessageText,
@@ -1487,6 +1561,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '总大小': 'Total size',
     '初始化设置': 'Initial setup',
     '切换账号自动同步所有会话': 'Automatically sync all sessions when switching accounts',
+    '同步定时任务': 'Sync scheduled tasks',
+    '切换账号时保持所有已保存账号的定时任务一致，包括重命名和删除': 'Keep scheduled tasks identical across saved accounts on switch, including renames and deletions',
+    '已同步': 'Synced',
+    '已同步定时任务': 'Scheduled tasks synced',
+    '个定时任务': ' scheduled task(s)',
+    '已开启同步定时任务': 'Scheduled task sync enabled',
+    '已关闭同步定时任务': 'Scheduled task sync disabled',
+    '同步定时任务设置失败: ': 'Could not save scheduled task sync: ',
     '开启后，切换账号时会自动同步当前账号的全部会话，包括之后新增的会话。': 'When enabled, switching accounts automatically syncs all sessions for the current account, including new sessions added later.',
     '选择切换账号时是否自动同步会话。此设置之后也可以在「会话」页面修改。': 'Choose whether to sync sessions automatically when switching accounts. You can change this later on the “Sessions” page.',
     '保存失败，请重试': 'Save failed, please try again',
@@ -1642,6 +1724,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '暂存提示词': 'Stash prompt', '暂存': 'Stashed', '引用文本': 'Quote text', '快捷短语': 'Quick phrases', '点击后发送': 'Send on click', '编辑 →': 'Edit →', '新增': 'Add', '批量操作': 'Batch actions', '批量管理': 'Batch manage', '全选': 'Select all', '取消全选': 'Deselect all', '已选 0': 'Selected 0',
     '分支到新会话': 'Start a new conversation here', '从这里开始新会话': 'Start a new conversation here', '复制到这条回复为止的聊天内容，在当前工作区继续聊；原会话不变。': 'Copy the conversation up to this reply into a new conversation in the current workspace. The original stays unchanged.', '正在创建分支会话…': 'Creating branch session…', '分支会话已创建，正在打开…': 'Branch created. Opening…', '分支会话已创建，但无法自动打开，请在会话列表中查找。': 'Branch created but could not open automatically. Check the sessions list.', '新会话未出现在列表中，请在会话列表中查找。': 'The new session is not listed yet. Check the sessions list.', '无法确认所选消息的分支位置，请稍后重试': 'Cannot confirm this reply position. Try again shortly.', '分支失败: ': 'Branch failed: ',
     '账号汇总': 'Account summary', '账号数': 'Accounts', '总积分': 'Total credits', '手机': 'Phone', '有效期至': 'Expires', '当前使用中': 'Currently active', '隐藏敏感信息': 'Mask sensitive info', '显示明文': 'Show plaintext', '登录新账号': 'Log in a new account', '没有可导出的账号备份': 'No account backups to export', '还没有备份账号。打开/登录一次 WorkBuddy 后会自动备份，稍后再来查看。': 'No account backups yet. Open or log in to WorkBuddy once and check again later.',
+    '软件渲染（闪屏兼容）': 'Software rendering (flicker workaround)',
+    '关闭硬件加速并使用软件渲染，可能降低性能。保存后请完全退出 WorkBuddy AI，再通过 WorkDaddy AI 启动；关闭此开关可恢复默认。': 'Disables hardware acceleration and uses software rendering, which may reduce performance. After saving, fully quit WorkBuddy AI and launch it through WorkDaddy AI. Turn this off to restore the default.',
+    '已保存，下次通过 WorkDaddy AI 启动时生效': 'Saved. Takes effect on the next launch through WorkDaddy AI',
+    '设置读取失败，请重新打开面板': 'Could not read settings. Reopen the panel',
+    '设置保存失败，请重试': 'Could not save settings. Try again',
     '语言': 'Language', '中文': 'Chinese', '英语': 'English', 'English': 'English', '跟随系统': 'Follow system', '设置语言': 'Language', '首次打开时自动跟随系统语言；未匹配时使用英语。': 'The first launch follows your system language. English is used when no match is found.', '语言设置已更新': 'Language updated',
     'CodeBuddy 暂不支持毛玻璃主题': 'Frosted glass theme is not yet supported in CodeBuddy', '默认': 'Default', 'WorkDaddy 主题': 'WorkDaddy theme', '毛玻璃': 'Frosted glass', '护眼绿': 'Eye-care green', '赛博紫': 'Cyber purple', '主题外观': 'Theme appearance', '壁纸': 'Wallpaper', '头像': 'Avatar', '自定义壁纸': 'Custom wallpaper', '背景蒙版': 'Background overlay', '背景毛玻璃': 'Background blur', '恢复默认': 'Restore default', '恢复官方头像': 'Restore official avatar',
     '加载中…': 'Loading…', '读取中…': 'Reading…', '正在读取设置…': 'Reading settings…', '查询中…': 'Checking…', '暂无快捷短语': 'No quick phrases', '暂无快捷短语，点击「+ 新增」添加': 'No quick phrases. Click “+ Add” to create one.', '当前还未添加模型': 'No models added yet', '还没有模型备份': 'No model backups yet', '当前筛选下没有会话': 'No sessions match the current filter', '暂无进行中的会话': 'No active sessions', '暂无官方壁纸': 'No built-in wallpapers', '还没有自定义壁纸，先上传一张': 'No custom wallpapers yet. Upload one to start.', '壁纸加载中…': 'Loading wallpapers…', '壁纸加载失败（daemon 不可达）': 'Wallpaper loading failed (daemon unavailable)',
@@ -1700,6 +1787,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     ' · 跳过': ' · Skipped', ' · 分叉': ' · Conflicts', '成功': 'Succeeded', '跳过': 'Skipped', '已跳过': 'Skipped', '部分失败': 'Partial failure', '分叉': 'Conflict', '处理中': 'Processing', '会话已分叉，已保留双方内容': 'Changed on both sides; neither side was overwritten', '部分文件失败': 'Some files failed', '当前任务未记录逐项明细。': 'No per-session details were recorded for this task.', '会话同步明细': 'Session sync details', '会话同步结果筛选': 'Filter session sync results', '当前分类没有会话。': 'No sessions in this category.', '正在把已标记的会话从「': 'Syncing marked sessions from “', '」同步到「': '” to “', '查看明细': 'View details', ' 个候选会话': ' candidate session(s)', ' 秒后自动关闭': ' seconds until automatic close',
     '收录 GitHub 和 Gitee 公开仓库。参考 ': 'Public GitHub and Gitee repositories are indexed. See ', '。': '.', '克隆示例仓库：': 'Clone the example repository: ', '删除 ': 'Delete ', ' 目录中不需要的示例任务。': ' directory tasks you do not need.', '把你的自动化任务 JSON 放进 ': 'Put your automation task JSON in ', ' 目录。': ' directory.', '提交改动并推送到 GitHub 或 Gitee。': 'Commit and push changes to GitHub or Gitee.', '在仓库简介中加入关键词 ': 'Add the keyword ',
     '导出账号': 'Export accounts', '导入账号': 'Import accounts', '导出会话': 'Export sessions', '导入会话': 'Import sessions', '导出快捷短语': 'Export quick phrases', '导入快捷短语': 'Import quick phrases', '同步选中到其他账号': 'Sync selected to another account', '删除选中': 'Delete selected', '操作会话': 'Session actions', '连通测试': 'Test connection', '编辑模型': 'Edit model', '模型已保存': 'Model saved', '模型已启用': 'Model enabled', '模型已复制': 'Model copied', '模型配置已共用': 'Model configuration shared', '与 {name} 共用模型配置': 'Model configuration shared with {name}', '当前模型': 'Current model', '备选模型': 'Backup models', '模型加载失败：': 'Failed to load models: ', '保存模型失败：': 'Failed to save model: ', '删除当前模型失败：': 'Failed to delete current model: ', '启用模型失败：': 'Failed to enable model: ', '连通测试失败：': 'Connection test failed: ',
+    '请选择壁纸文件夹': 'Choose a wallpaper folder', '壁纸模式': 'Wallpaper mode', '手动应用': 'Manual', '文件夹随机': 'Shuffle folder', '壁纸文件夹': 'Wallpaper folder', '选择或填写文件夹路径': 'Choose or enter a folder path', '选择文件夹': 'Choose folder', '切换间隔': 'Change every', '1 分钟': '1 minute', '3 分钟': '3 minutes', '5 分钟': '5 minutes', '10 分钟': '10 minutes', '30 分钟': '30 minutes', '1 小时': '1 hour', '自定义': 'Custom', '分钟': 'minutes', '自定义切换间隔（分钟）': 'Custom interval (minutes)', '立即换一张': 'Next wallpaper', '已暂停，恢复毛玻璃主题后继续': 'Paused until the frosted theme resumes', '当前：': 'Current: ', '等待应用壁纸': 'Waiting to apply wallpaper', '壁纸设置保存失败': 'Could not save wallpaper settings', '仅读取此文件夹内的 PNG / JPG / WebP，不复制或修改原文件；自动跳过超过 20MB 或 1600 万像素的图片。': 'Reads PNG / JPG / WebP from this folder without copying or modifying originals. Images over 20MB or 16 megapixels are skipped.',
     '选择要查看的账号': 'Choose an account to view', '选择账号并输入密码后导出备份': 'Choose accounts and enter a password to export backups', '从加密导出文件导入账号备份': 'Import account backups from an encrypted export', '使用密码导出选中会话': 'Export selected sessions with a password', '使用密码导出选中快捷短语': 'Export selected quick phrases with a password', '从加密文件导入会话': 'Import sessions from an encrypted file', '从加密文件导入快捷短语': 'Import quick phrases from an encrypted file', '仅支持 PNG / JPG / WebP': 'PNG / JPG / WebP only', '点击或拖拽上传壁纸': 'Click or drag to upload a wallpaper', '点击选择图片，或拖拽到此处': 'Click to choose an image, or drag it here', '支持 PNG / JPG / WebP，自动压缩；可添加多张': 'PNG / JPG / WebP supported; images are compressed automatically',
     '未命名账号': 'Unnamed account', '未命名模型': 'Unnamed model', '未命名': 'Unnamed', '未知错误': 'Unknown error', '未知': 'Unknown', '有效期未知': 'Expiry unknown', '未找到输入框': 'Composer not found', '输入框内容为空': 'Composer is empty', '当前输入框暂不支持引用插入': 'The current composer does not support quote insertion', '引用插入失败，请重试': 'Could not insert quote. Please try again', '短语不能为空': 'Quick phrase cannot be empty', '请输入快捷短语': 'Enter a quick phrase', '删除快捷短语': 'Delete quick phrase', '编辑快捷短语': 'Edit quick phrase', '新增快捷短语': 'Add quick phrase', '确定删除': 'Confirm deletion', '确认永久删除': 'Confirm permanent deletion',
     '本机回环 CDP 注入 · 不改官方安装包': 'Local CDP injection · official app untouched', '一个基于 ': 'A ', ' 的 WorkBuddy 桌面端增强工具。零侵入、零重签名——只把界面组件注入到正在运行的 WorkBuddy 渲染进程里。': ' WorkBuddy desktop enhancement tool using Chrome DevTools Protocol (CDP). No intrusion or re-signing; UI components are injected into the running renderer.', '问题反馈': 'Report an issue',
@@ -1852,7 +1940,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '安装程序已打开，请按提示退出 WorkBuddy 并完成安装。': 'The installer is open. Please quit WorkBuddy as prompted and finish installing.',
     '安装程序已打开，请到任务栏选择安装窗口；按提示退出 WorkBuddy 后完成安装。': 'The installer is open. Select its window from the taskbar, then quit WorkBuddy as prompted to finish installing.',
     '停止旧服务…': 'Stopping old service…', '发现新版本，准备更新…': 'New version available; preparing to update…',
-    '已应用主题「': 'Theme applied: “', '已恢复官方头像': 'Restored the official avatar', '已应用官方头像': 'Applied the official avatar',
+    '已应用主题「': 'Theme applied: “', '已跟随系统，当前使用「': 'Following system, currently “', '」外观': '” appearance', '跟随操作系统的深浅色模式自动切换': 'Follow the operating system dark/light mode and switch automatically', '已恢复官方头像': 'Restored the official avatar', '已应用官方头像': 'Applied the official avatar',
     '头像已更新 ✓': 'Avatar updated ✓', '头像处理失败：': 'Avatar processing failed:',
     '已开启：需要你决策时 WorkBuddy 会用弹窗提问（全局生效）': 'Enabled: WorkBuddy asks with a dialog when your decision is needed (applies globally)',
     // —— 第八批：壁纸/授权/休眠/开启风险文案与时间相对词前导空格变体 ——
@@ -2699,6 +2787,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function mountPersistentOverlay(node) {
       node.setAttribute('data-wbs-panel-overlay', '');
       if (CAPS.panelAppearance === 'light') node.setAttribute('data-wbs-appearance', 'light');
+      if (CAPS.nativeComposer) node.setAttribute('data-wbs-profile', PROFILE_ID);
       document.body.appendChild(node);
       if (nativePanelMount) nativePanelMount.keep(node);
     }
@@ -4459,6 +4548,21 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       } catch (e) {}
     }
 
+    // WorkBuddy 自带的会话历史索引使用稳定的 aside class，但父级 teams 布局会变化。
+    // 开启 WorkDaddy 消息索引时移除官方导航，避免两套索引重叠；body observer 会在官方重建后再次清理。
+    function removeOfficialConversationHistoryNavigation(enabled) {
+      if (!enabled || typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return 0;
+      var removed = 0;
+      var nodes;
+      try { nodes = document.querySelectorAll('aside.conversation-history-navigation'); } catch (_) { return 0; }
+      for (var i = 0; i < nodes.length; i++) {
+        try {
+          if (nodes[i] && typeof nodes[i].remove === 'function') { nodes[i].remove(); removed++; }
+        } catch (_) {}
+      }
+      return removed;
+    }
+
     // 会话消息导航：完整索引来自 controller.messageStore，DOM 仅用于判断当前可见位置。
     function createMessageNavigation() {
       var surface = null;
@@ -4907,6 +5011,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
       function setEnabled(enabled) {
         if (enabled) {
+          removeOfficialConversationHistoryNavigation(true);
           sync();
           return;
         }
@@ -5061,6 +5166,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
       listen(window, 'resize', onWindowChange);
       listen(window, 'scroll', onWindowChange, true);
+      removeOfficialConversationHistoryNavigation(sessState.messageNav);
       sync();
       registerDisposer(function () {
         disposed = true;
@@ -5210,6 +5316,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function onDomChange() {
       if (!alive) return;
       guardSessionChange();
+      removeOfficialConversationHistoryNavigation(sessState.messageNav);
       if (messageNavigation) messageNavigation.sync();
       scheduleForkButtons();
       scheduleFabPos();
@@ -5228,6 +5335,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var html = document.documentElement;
       var glass = html && html.getAttribute('data-wbs-theme-id') === 'nebula';
       var selector = '.teams-container .cr-input-toolbar__right > span.cr-voice-trigger-tooltip,' +
+        '.teams-container .cr-input-toolbar__right > span.cr-voice-trigger-wrap > span.cr-voice-trigger-tooltip,' +
         '.teams-container .cr-input-toolbar__right > span.cr-context-usage-tooltip-trigger,' +
         '.teams-container .cr-input-toolbar__right > span.cr-enhance-button-tooltip';
       document.querySelectorAll(selector).forEach(function (node) {
@@ -5867,7 +5975,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (!alive || (!arr.length && !ids.length)) return;
       var items = document.querySelectorAll('.cb-message-queue-item');
       Array.prototype.forEach.call(items, function (it) {
-        var actions = it.querySelector('.cb-message-queue-item-actions');
+        // WorkBuddy 5.8 renamed the actions class while keeping the queue item
+        // class. Accept both names; the parent path is intentionally ignored.
+        var actions = it.querySelector('.conversation-message-queue-item-actions, .cb-message-queue-item-actions');
         if (!actions) return;
         var hasTag = !!it.querySelector('.wbs-queue-tag');
         var matched = isStashItem(sessionId, it);
@@ -6711,7 +6821,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         section.querySelectorAll('[name="wbs-persona-mode"]').forEach(function (radio) { radio.disabled = false; radio.checked = radio.value === mode; });
         info.sources.forEach(function (source) {
           var option = document.createElement('option'); option.value = source.uid;
-          var name = source.uid === 'legacy' ? wbsTranslateString('升级前共用的设置', WBS_LANGUAGE) : state.mask ? maskAccountName(source.nickname) : source.nickname;
+          var name = source.uid === 'legacy' ? wbsTranslateString('升级前共用的设置', WBS_LANGUAGE) : accountDisplayName(source, state.mask);
           option.textContent = name + (source.available ? '' : ' · ' + wbsTranslateString('未设置', WBS_LANGUAGE));
           option.disabled = !source.available;
           option.setAttribute('data-wbs-i18n-skip', '');
@@ -7047,7 +7157,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function officialWebsiteOrigin() {
       if (PROFILE_ID === 'workbuddy-ai') return 'https://www.workbuddy.ai';
       if (PROFILE_ID === 'codebuddy-intl') return 'https://www.codebuddy.ai';
-      if (PROFILE_ID === 'codebuddy-cn') return 'https://www.codebuddy.cn';
+      // CodeBuddy CN exposes the growth APIs on codebuddy.cn, but its web
+      // growth-center route is only implemented by the WorkBuddy site. Keep
+      // the device-code login flow while opening that operable host.
+      if (PROFILE_ID === 'codebuddy-cn') return 'https://www.workbuddy.cn';
       return 'https://www.workbuddy.cn';
     }
 
@@ -7737,22 +7850,39 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     function copyPlainText(text) {
-      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-        return navigator.clipboard.writeText(String(text));
+      text = String(text);
+      function copyWithSelection() {
+        return new Promise(function (resolve, reject) {
+          var previousFocus = document.activeElement;
+          var textarea = document.createElement('textarea');
+          textarea.value = text;
+          textarea.setAttribute('readonly', '');
+          textarea.style.position = 'fixed';
+          textarea.style.left = '-9999px';
+          textarea.style.top = '0';
+          textarea.style.opacity = '0';
+          var copied = false;
+          try {
+            document.body.appendChild(textarea);
+            textarea.select();
+            copied = document.execCommand('copy');
+          } catch (_) {
+          } finally {
+            textarea.remove();
+            if (previousFocus && typeof previousFocus.focus === 'function') {
+              try { previousFocus.focus({ preventScroll: true }); } catch (_) {}
+            }
+          }
+          if (copied) resolve(); else reject(new Error('复制失败'));
+        });
       }
-      return new Promise(function (resolve, reject) {
-        var textarea = document.createElement('textarea');
-        textarea.value = String(text);
-        textarea.setAttribute('readonly', '');
-        textarea.style.position = 'fixed';
-        textarea.style.opacity = '0';
-        document.body.appendChild(textarea);
-        textarea.select();
-        var copied = false;
-        try { copied = document.execCommand('copy'); } catch (_) {}
-        document.body.removeChild(textarea);
-        if (copied) resolve(); else reject(new Error('复制失败'));
-      });
+      // Electron may expose the Clipboard API while denying write permission.
+      try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          return Promise.resolve(navigator.clipboard.writeText(text)).catch(copyWithSelection);
+        }
+      } catch (_) {}
+      return copyWithSelection();
     }
 
     // 导出账号：密码必填，daemon 使用随机 salt 加密后触发浏览器下载。
@@ -9132,7 +9262,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     // ===== 会话 pane（构建：账号/时间筛选 + 按空间分组[默认2条/展开全部] + 刷新 + 批量操作[迁移/删除]）=====
-    var sessionsState = { uid: undefined, currentUid: '', range: 'all', minBytes: 0, totalBytes: null, list: [], selected: {}, wsExpanded: {}, accounts: [], batchMode: false, autoCopy: null, autoCopyAll: false, autoCopyJob: null, autoCopyPollTimer: null };
+    var sessionsState = { uid: undefined, currentUid: '', range: 'all', minBytes: 0, totalBytes: null, list: [], selected: {}, wsExpanded: {}, accounts: [], batchMode: false, autoCopy: null, autoCopyAll: false, autoSyncAutomations: false, autoSyncAutomationsBusy: false, autoCopyJob: null, autoCopyPollTimer: null };
     function isTaskSessionRecordUI(s) {
       // 任务（未选择项目/一次性）会话：以官方 is_playground=1 为准。
       // 普通工作区也用 WorkBuddy\\YYYY-MM-DD-HH-MM-SS 命名，仅凭 cwd 无法区分。
@@ -9226,6 +9356,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<span class="wbs-sess-auto-all-box" aria-hidden="true"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="12" height="12" rx="2"/><path class="wbs-sess-auto-all-check" d="m4.5 8 2.2 2.2L11.5 5.5"/></svg></span>' +
         '<span class="wbs-sess-auto-all-label">自动同步所有会话</span>' +
         '</button>' +
+        '<button class="wbs-sess-auto-all" type="button" id="wbs-sess-auto-automations" role="checkbox" aria-checked="false" aria-label="同步定时任务" title="切换账号时保持所有已保存账号的定时任务一致，包括重命名和删除">' +
+        '<span class="wbs-sess-auto-all-box" aria-hidden="true"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="12" height="12" rx="2"/><path class="wbs-sess-auto-all-check" d="m4.5 8 2.2 2.2L11.5 5.5"/></svg></span>' +
+        '<span class="wbs-sess-auto-all-label">同步定时任务</span>' +
+        '</button>' +
         '<button class="wbs-sess-bbtn" type="button" id="wbs-sess-batch">批量操作</button>' +
         '<button class="wbs-sess-bbtn" type="button" id="wbs-sess-import" title="从加密文件导入会话">' + IMPORT_ICON + '<span>导入</span></button>' +
         '<span class="wbs-sess-count" id="wbs-sess-count"></span>' +
@@ -9264,6 +9398,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       wireSessionsPane();
       loadSessionAccounts();
       loadSessions();
+      loadAutomationSyncSetting();
       pollActiveSessionCopyJob();
       pollSessionExport();
       registerDisposer(function () { if (sessionsState.autoCopyPollTimer) clearTimeout(sessionsState.autoCopyPollTimer); });
@@ -9400,6 +9535,13 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       });
     }
 
+    function loadAutomationSyncSetting() {
+      api('/api/automations/auto-sync').then(function (result) {
+        sessionsState.autoSyncAutomations = !!(result && result.enabled);
+        updateAutomationSyncButton();
+      }).catch(function () { updateAutomationSyncButton(); });
+    }
+
     function filteredSessions() {
       var minBytes = Number(sessionsState.minBytes) || 0;
       return sessionsState.list.filter(function (session) {
@@ -9413,6 +9555,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var countEl = sessionsPane.querySelector('#wbs-sess-count');
       if (!listEl) return;
       updateAutoCopyAllButton();
+      if (typeof updateAutomationSyncButton === 'function') updateAutomationSyncButton();
       if (!filteredSessions().length) {
         listEl.innerHTML = '<div class="wbs-empty">当前筛选下没有会话</div>';
         updateSessionSummary(countEl);
@@ -9530,6 +9673,38 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       button.disabled = !!sessionsState.batchMode || !!sessionsState.autoCopyAllBusy;
       button.classList.toggle('active', enabled);
       button.setAttribute('aria-checked', enabled ? 'true' : 'false');
+    }
+    function updateAutomationSyncButton() {
+      if (!sessionsPane) return;
+      var button = sessionsPane.querySelector('#wbs-sess-auto-automations');
+      if (!button) return;
+      var enabled = !!sessionsState.autoSyncAutomations;
+      button.disabled = !!sessionsState.batchMode || !!sessionsState.autoSyncAutomationsBusy;
+      button.classList.toggle('active', enabled);
+      button.setAttribute('aria-checked', enabled ? 'true' : 'false');
+    }
+    function toggleAutomationSync(enabled) {
+      var button = sessionsPane && sessionsPane.querySelector('#wbs-sess-auto-automations');
+      if (!button || button.disabled) return;
+      var previous = !!sessionsState.autoSyncAutomations;
+      sessionsState.autoSyncAutomations = !!enabled;
+      sessionsState.autoSyncAutomationsBusy = true;
+      updateAutomationSyncButton();
+      api('/api/automations/auto-sync', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: !!enabled }),
+      }).then(function (response) {
+        sessionsState.autoSyncAutomations = !!(response && response.enabled);
+        sessionsState.autoSyncAutomationsBusy = false;
+        updateAutomationSyncButton();
+        toast(sessionsState.autoSyncAutomations ? '已开启同步定时任务' : '已关闭同步定时任务', false, root);
+      }).catch(function (e) {
+        sessionsState.autoSyncAutomations = previous;
+        sessionsState.autoSyncAutomationsBusy = false;
+        updateAutomationSyncButton();
+        toast('同步定时任务设置失败: ' + (e.message || e), true, root);
+      });
     }
     function toggleAutoCopyAll(enabled) {
       var button = sessionsPane && sessionsPane.querySelector('#wbs-sess-auto-all');
@@ -9798,6 +9973,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (autoCopyAllBtn) {
         autoCopyAllBtn.addEventListener('click', function () {
           toggleAutoCopyAll(autoCopyAllBtn.getAttribute('aria-checked') !== 'true');
+        });
+      }
+      var autoAutomationBtn = sessionsPane.querySelector('#wbs-sess-auto-automations');
+      if (autoAutomationBtn) {
+        autoAutomationBtn.addEventListener('click', function () {
+          toggleAutomationSync(autoAutomationBtn.getAttribute('aria-checked') !== 'true');
         });
       }
       // 时间 Segment 组件
@@ -10663,13 +10844,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<label class="wbs-ask-label" for="wbs-fab-auto-dock">自动贴边<span class="wbs-ask-hint">闲置 5 秒后收起，鼠标靠近即展开</span></label>' +
         '<label class="wbs-switch"><input type="checkbox" id="wbs-fab-auto-dock"><span class="wbs-switch-slider"></span></label>' +
         '</div></div>' +
-        (codeBuddyTheme ? '' : '<div class="wbs-pcard">' +
+        (codeBuddyTheme ? '<div class="wbs-pcard" id="wbs-native-theme-card">' +
+        '<div class="wbs-pcard-title">主题外观</div>' +
+        '<div class="wbs-theme-seg" id="wbs-theme-seg" role="radiogroup" aria-label="主题外观">' +
+        '<label class="wbs-theme-opt wbs-theme-option" title="跟随操作系统的深浅色模式自动切换"><input type="radio" name="wbs-theme" value="system"><span>跟随系统</span></label>' +
+        '<label class="wbs-theme-opt wbs-theme-option"><input type="radio" name="wbs-theme" value="default"><span>浅色</span></label>' +
+        '<label class="wbs-theme-opt wbs-theme-option"><input type="radio" name="wbs-theme" value="dark"><span>深色</span></label>' +
+        '</div></div>' : '<div class="wbs-pcard">' +
         '<div class="wbs-theme-takeover-row">' +
         '<div class="wbs-pcard-title">接管主题</div>' +
         '<label class="wbs-switch"><input type="checkbox" id="wbs-theme-takeover" checked aria-label="接管主题"><span class="wbs-switch-slider"></span></label></div>' +
         '<div class="wbs-theme-managed" id="wbs-theme-appearance-options">' +
         '<div class="wbs-pcard-title">主题外观</div>' +
         '<div class="wbs-theme-seg" id="wbs-theme-seg" role="radiogroup" aria-label="主题外观">' +
+        '<label class="wbs-theme-opt wbs-theme-option" title="跟随操作系统的深浅色模式自动切换"><input type="radio" name="wbs-theme" value="system"><span>跟随系统</span></label>' +
         '<label class="wbs-theme-opt wbs-theme-option"><input type="radio" name="wbs-theme" value="default"><span>浅色</span></label>' +
         '<label class="wbs-theme-opt wbs-theme-option"><input type="radio" name="wbs-theme" value="dark"><span>深色</span></label>' +
         '<label class="wbs-theme-opt wbs-theme-option"><input type="radio" name="wbs-theme" value="eye-care"><span>护眼绿</span></label>' +
@@ -10687,9 +10875,22 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<div class="wbs-wallpapers" id="wbs-wallpapers"><div class="wbs-wp-loading">壁纸加载中…</div></div>' +
         '</div>' +
         '<div class="wbs-bg-panel" data-src-panel="custom" style="display:none">' +
+        '<div class="wbs-wallpaper-mode" role="radiogroup" aria-label="壁纸模式">' +
+        '<label><input type="radio" name="wbs-wallpaper-mode" value="manual" checked>手动应用</label>' +
+        '<label><input type="radio" name="wbs-wallpaper-mode" value="random">文件夹随机</label>' +
+        '</div>' +
+        '<div id="wbs-wallpaper-random" hidden>' +
+        '<label class="wbs-wallpaper-label" for="wbs-wallpaper-directory">壁纸文件夹</label>' +
+        '<div class="wbs-wallpaper-folder"><input id="wbs-wallpaper-directory" type="text" placeholder="选择或填写文件夹路径" autocomplete="off" spellcheck="false"><button type="button" id="wbs-wallpaper-pick" class="wbs-wallpaper-button">选择文件夹</button></div>' +
+        '<div class="wbs-wallpaper-interval"><label for="wbs-wallpaper-interval">切换间隔</label><select id="wbs-wallpaper-interval"><option value="1">1 分钟</option><option value="3">3 分钟</option><option value="5">5 分钟</option><option value="10" selected>10 分钟</option><option value="30">30 分钟</option><option value="60">1 小时</option><option value="custom">自定义</option></select>' +
+        '<label id="wbs-wallpaper-custom-wrap" hidden><input type="number" id="wbs-wallpaper-minutes" min="1" max="1440" step="1" value="10" aria-label="自定义切换间隔（分钟）"><span>分钟</span></label></div>' +
+        '<div class="wbs-wallpaper-actions"><button type="button" id="wbs-wallpaper-next" class="wbs-wallpaper-button">立即换一张</button><span class="wbs-wallpaper-status" id="wbs-wallpaper-status" role="status" aria-live="polite"></span></div>' +
+        '<div class="wbs-wallpaper-hint">仅读取此文件夹内的 PNG / JPG / WebP，不复制或修改原文件；自动跳过超过 20MB 或 1600 万像素的图片。</div>' +
+        '</div><div id="wbs-wallpaper-manual">' +
         '<div class="wbs-bg-upload" id="wbs-bg-upload" title="点击选择图片，或拖拽到此处"><span class="wbs-bg-upload-ico">+</span><span>点击或拖拽上传壁纸</span><span class="wbs-bg-upload-hint">支持 PNG / JPG / WebP，自动压缩；可添加多张</span></div>' +
         '<div class="wbs-wallpapers wbs-custom-wallpapers" id="wbs-custom-wallpapers"><div class="wbs-wp-loading">壁纸加载中…</div></div>' +
         '<input type="file" id="wbs-theme-file" accept="image/png,image/jpeg,image/webp" style="display:none">' +
+        '</div>' +
         '</div>' +
         '<div class="wbs-mask-row">' +
         '<label class="wbs-blur-label" for="wbs-mask-range">背景蒙版<span class="wbs-blur-hint">黑色半透明遮罩，压暗背景图</span></label>' +
@@ -10923,6 +11124,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             '</div>' +
           '</div>' +
         '</div>' +
+        (WBS_PLATFORM === 'win32' && WBS_PROFILE_IS_AI ?
+          '<div class="wbs-pcard wbs-settings-card wbs-rendering-card">' +
+            '<div class="wbs-settings-row"><label class="wbs-pcard-title" for="wbs-software-rendering">软件渲染（闪屏兼容）</label>' +
+              '<label class="wbs-switch wbs-telemetry-switch"><input type="checkbox" id="wbs-software-rendering" aria-label="软件渲染（闪屏兼容）" aria-describedby="wbs-rendering-help" disabled><span class="wbs-switch-slider"></span></label>' +
+            '</div>' +
+            '<div class="wbs-pcard-sub" id="wbs-rendering-help">关闭硬件加速并使用软件渲染，可能降低性能。保存后请完全退出 WorkBuddy AI，再通过 WorkDaddy AI 启动；关闭此开关可恢复默认。</div>' +
+            '<div class="wbs-pcard-sub" id="wbs-rendering-status" role="status" aria-live="polite">正在读取设置…</div>' +
+          '</div>' : '') +
         '<div class="wbs-pcard wbs-telemetry-card" id="wbs-telemetry-card">' +
           '<div class="wbs-telemetry-head">' +
             '<div class="wbs-telemetry-label"><span class="wbs-pcard-title">发送错误诊断</span><span class="wbs-telemetry-help" tabindex="0" aria-label="查看错误诊断说明"><svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="8"/><path d="M8.4 7.6a1.8 1.8 0 1 1 2.8 1.45c-.75.48-1.2.85-1.2 1.75M10 13.7v.1"/></svg><span class="wbs-telemetry-tooltip" role="tooltip">此开关控制脱敏错误诊断。匿名安装数和日活独立统计（随机安装标识、系统、架构、版本、客户端类型及出口国家），不受此开关影响。不包含账号、会话内容、Token 或 API Key。</span></span></div>' +
@@ -10985,9 +11194,43 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         });
       }
       wireTelemetrySettings();
+      wireClientLaunchSettings();
       acRenderMonitorLogModal();
       // 自动更新：检查 + 红点 + 更新卡片
       checkForUpdate();
+    }
+
+    function wireClientLaunchSettings() {
+      var toggle = aboutPane.querySelector('#wbs-software-rendering');
+      var status = aboutPane.querySelector('#wbs-rendering-status');
+      if (!toggle || !status) return;
+      var saved = false;
+      api('/api/client-launch-settings').then(function (data) {
+        saved = data.softwareRendering === true;
+        toggle.checked = saved;
+        toggle.disabled = data.supported !== true;
+        status.textContent = '';
+      }).catch(function () {
+        status.textContent = '设置读取失败，请重新打开面板';
+      });
+      toggle.addEventListener('change', function () {
+        var next = toggle.checked;
+        toggle.disabled = true;
+        status.textContent = '保存中…';
+        api('/api/client-launch-settings', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ softwareRendering: next }),
+        }).then(function (data) {
+          saved = data.softwareRendering === true;
+          toggle.checked = saved;
+          toggle.disabled = data.supported !== true;
+          status.textContent = '已保存，下次通过 WorkDaddy AI 启动时生效';
+        }).catch(function () {
+          toggle.checked = saved;
+          toggle.disabled = false;
+          status.textContent = '设置保存失败，请重试';
+        });
+      });
     }
 
     function wireTelemetrySettings() {
@@ -11337,7 +11580,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       card.style.display = visible ? '' : 'none';
       var textCard = themePane.querySelector('#wbs-text-shadow-card');
       if (textCard) textCard.style.display = visible ? '' : 'none';
-      if (visible) loadWallpapers();
+      if (visible) { loadWallpapers(); loadWallpaperRotation(); }
     }
 
     // 关闭接管后只隐藏主题外观选项；头像和悬浮机器人独立于主题接管。
@@ -11394,6 +11637,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         dockSwitch.checked = fabQuietMode.isEnabled();
         dockSwitch.addEventListener('change', function () { fabQuietMode.setEnabled(this.checked); });
       }
+      wireWallpaperRotation();
       // 壁纸通过下方来源按钮管理，主题单选项使用 change 事件。
       themePane.addEventListener('click', function (e) {
         var t = e.target;
@@ -11569,6 +11813,111 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       // （开发调试入口已抽离至独立脚本 picker-internal.js，连点 logo 右侧按钮呼出）
     }
 
+    var wallpaperRotationState = null;
+    var wallpaperRotationBusy = false;
+    var wallpaperRotationDraft = false;
+    var wallpaperRotationReadSerial = 0;
+    function renderWallpaperRotation(info) {
+      if (!alive || !themePane || !info) return;
+      var previous = wallpaperRotationState;
+      wallpaperRotationState = info;
+      var random = info.mode === 'random';
+      if (random && (!previous || previous.mode !== 'random')) {
+        themePane.querySelectorAll('.wbs-bg-src').forEach(function (button) { button.classList.toggle('active', button.getAttribute('data-src') === 'custom'); });
+        themePane.querySelectorAll('.wbs-bg-panel').forEach(function (panel) { panel.style.display = panel.getAttribute('data-src-panel') === 'custom' ? '' : 'none'; });
+      }
+      themePane.querySelectorAll('input[name="wbs-wallpaper-mode"]').forEach(function (input) { input.checked = input.value === info.mode; });
+      var randomPanel = themePane.querySelector('#wbs-wallpaper-random');
+      var manualPanel = themePane.querySelector('#wbs-wallpaper-manual');
+      if (!randomPanel) return;
+      randomPanel.hidden = !random;
+      manualPanel.hidden = random;
+      var directory = themePane.querySelector('#wbs-wallpaper-directory');
+      if (document.activeElement !== directory) directory.value = info.directory || '';
+      directory.title = info.directory || '';
+      var interval = themePane.querySelector('#wbs-wallpaper-interval');
+      var minutes = themePane.querySelector('#wbs-wallpaper-minutes');
+      if (document.activeElement !== interval && document.activeElement !== minutes) {
+        interval.value = [1,3,5,10,30,60].indexOf(info.intervalMinutes) >= 0 ? String(info.intervalMinutes) : 'custom';
+        minutes.value = info.intervalMinutes;
+      }
+      themePane.querySelector('#wbs-wallpaper-custom-wrap').hidden = interval.value !== 'custom';
+      var status = themePane.querySelector('#wbs-wallpaper-status');
+      status.textContent = !info.directory ? '请选择壁纸文件夹' : info.error || (info.paused ? '已暂停，恢复毛玻璃主题后继续' : (info.current ? '当前：' + info.current : '等待应用壁纸'));
+      status.title = status.textContent;
+      status.dataset.error = info.error ? '1' : '0';
+      themePane.querySelector('#wbs-wallpaper-next').disabled = wallpaperRotationBusy || !random || !info.directory || info.paused;
+    }
+    function loadWallpaperRotation() {
+      if (!themePane || !themePane.querySelector('#wbs-wallpaper-random') || wallpaperRotationBusy || wallpaperRotationDraft) return;
+      var serial = ++wallpaperRotationReadSerial;
+      return api('/api/wallpaper-rotation').then(function (info) {
+        if (serial === wallpaperRotationReadSerial && !wallpaperRotationBusy) renderWallpaperRotation(info);
+      }).catch(function () {});
+    }
+    function wireWallpaperRotation() {
+      var panel = themePane.querySelector('#wbs-wallpaper-random');
+      if (!panel || panel.dataset.wired) return;
+      panel.dataset.wired = '1';
+      var directory = themePane.querySelector('#wbs-wallpaper-directory');
+      var interval = themePane.querySelector('#wbs-wallpaper-interval');
+      var minutes = themePane.querySelector('#wbs-wallpaper-minutes');
+      var pick = themePane.querySelector('#wbs-wallpaper-pick');
+      var next = themePane.querySelector('#wbs-wallpaper-next');
+      function busy(value) {
+        wallpaperRotationBusy = value;
+        wallpaperRotationReadSerial++;
+        themePane.querySelectorAll('input[name="wbs-wallpaper-mode"],#wbs-wallpaper-random input,#wbs-wallpaper-random select,#wbs-wallpaper-random button').forEach(function (node) { node.disabled = value; });
+        if (!value && wallpaperRotationState) next.disabled = wallpaperRotationState.mode !== 'random' || !wallpaperRotationState.directory || wallpaperRotationState.paused;
+      }
+      function choose() {
+        return api('/api/wallpaper-rotation/pick', { method: 'POST' }).then(function (info) {
+          if (!alive || info.cancelled) return false;
+          directory.value = info.directory;
+          return true;
+        });
+      }
+      function save(mode, shouldPick) {
+        if (wallpaperRotationBusy) return;
+        busy(true);
+        var prepare = shouldPick ? choose() : Promise.resolve(true);
+        return prepare.then(function (proceed) {
+          if (!proceed || !alive) return;
+          return api('/api/wallpaper-rotation', { method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ mode: mode, directory: directory.value.trim(), intervalMinutes: Number(interval.value === 'custom' ? minutes.value : interval.value) })
+          }).then(function (info) { wallpaperRotationDraft = false; renderWallpaperRotation(info); });
+        }).catch(function (e) { if (alive) toast(e.message || '壁纸设置保存失败', true, root); })
+          .finally(function () { if (!alive) return; busy(false); if (wallpaperRotationState) renderWallpaperRotation(wallpaperRotationState); else loadWallpaperRotation(); });
+      }
+      themePane.querySelectorAll('input[name="wbs-wallpaper-mode"]').forEach(function (radio) {
+        radio.addEventListener('change', function () {
+          if (!radio.checked) return;
+          if (radio.value === 'random' && !directory.value.trim()) {
+            wallpaperRotationDraft = true;
+            renderWallpaperRotation(Object.assign({}, wallpaperRotationState, { mode: 'random', directory: '', current: '', paused: false }));
+            return;
+          }
+          wallpaperRotationDraft = false;
+          save(radio.value);
+        });
+      });
+      pick.addEventListener('click', function () { save('random', true); });
+      directory.addEventListener('change', function () { save('random'); });
+      interval.addEventListener('change', function () {
+        themePane.querySelector('#wbs-wallpaper-custom-wrap').hidden = interval.value !== 'custom';
+        if (interval.value === 'custom') { minutes.focus(); minutes.select(); } else save('random');
+      });
+      minutes.addEventListener('change', function () { save('random'); });
+      next.addEventListener('click', function () {
+        if (wallpaperRotationBusy) return;
+        busy(true);
+        api('/api/wallpaper-rotation/next', { method: 'POST' }).then(renderWallpaperRotation)
+          .catch(function (e) { if (alive) toast(e.message || '切换壁纸失败', true, root); }).finally(function () { busy(false); });
+      });
+      loadWallpaperRotation();
+    }
+    setBuildInterval(function () { if (state.open && themePane && themePane.style.display !== 'none') loadWallpaperRotation(); }, 15000);
+
     // 官方壁纸网格：加载 /api/wallpapers，渲染缩略图，点击切换背景图
     // file:// 页面无法直接 <img src="http://...">（Electron 拦截），改为 fetch → blob → objectURL 预览
     // 面板高度固定为主题页高度：防止切 tab 时高度忽高忽低（首次主题页壁纸渲染后锁定一次）
@@ -11580,11 +11929,22 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var bodyEl = panel.querySelector('.wbs-body');
       if (bodyEl) bodyEl.style.overflowY = 'auto';
     }
+    var wallpaperPreviewUrls = [];
+    var wallpaperPreviewSerial = 0;
+    function releaseWallpaperPreviews() {
+      wallpaperPreviewSerial++;
+      wallpaperPreviewUrls.forEach(function (url) { URL.revokeObjectURL(url); });
+      wallpaperPreviewUrls = [];
+    }
+    registerDisposer(releaseWallpaperPreviews);
+    registerDisposer(function () { if (window.__wbsWallpaperRuntime) window.__wbsWallpaperRuntime.dispose(); });
     function loadWallpapers(force) {
       var grid = root.querySelector('#wbs-wallpapers');
       var cgrid = root.querySelector('#wbs-custom-wallpapers');
       if (!grid && !cgrid) return;
       if (grid && grid.dataset.loaded && !force) return;
+      releaseWallpaperPreviews();
+      var previewSerial = wallpaperPreviewSerial;
       if (grid) grid.dataset.loaded = '1';
       var base = API.replace(/\/api\/?$/, '');
       var wallpaperRequest = api('/api/wallpapers');
@@ -11592,6 +11952,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         setTimeout(function () { reject(new Error('壁纸请求超时')); }, 8000);
       });
       Promise.race([wallpaperRequest, wallpaperTimeout]).then(function (d) {
+        if (!alive || previewSerial !== wallpaperPreviewSerial) return;
         var list = d.wallpapers || [];
         var customList = d.customWallpapers || [];
         var current = d.currentWallpaper || null;
@@ -11633,7 +11994,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           g.querySelectorAll('.wbs-wp-thumb img').forEach(function (im) {
             fetch(im.getAttribute('data-src'), { cache: 'no-store' })
               .then(function (r) { return r.ok ? r.blob() : Promise.reject(new Error('HTTP ' + r.status)); })
-              .then(function (blob) { im.src = URL.createObjectURL(blob); })
+              .then(function (blob) {
+                if (!alive || previewSerial !== wallpaperPreviewSerial || !im.isConnected) return;
+                var url = URL.createObjectURL(blob); wallpaperPreviewUrls.push(url); im.src = url;
+              })
               .catch(function () {
                 im.alt = '加载失败';
                 im.style.opacity = '.25';
@@ -11656,6 +12020,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
                 if (!r || !r.ok) throw new Error((r && r.error) || '切换壁纸失败');
                 toast('已应用壁纸「' + (card.getAttribute('title') || name) + '」', false, root);
                 loadWallpapers(true);
+                loadWallpaperRotation();
               }).catch(function (e) {
                 toast('切换壁纸失败: ' + (e.message || e), true, root);
               }).finally(function () { card.classList.remove('busy'); });
@@ -12026,10 +12391,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         });
     }
 
-    // ===== 主题系统（WorkDaddy 换肤）：segmented 切换 =====
+    // ===== 主题系统：WorkDaddy 换肤 / CodeBuddy 官方外观切换 =====
     // 主题 = CSS 变量覆盖（--wb-* / --dc-*），daemon 通过 CDP 注入 <style>。
-    // 五种外观共用主题接管；只有毛玻璃使用壁纸、蒙版和背景模糊。
-    var ALLOWED_THEMES = ['default', 'dark', 'nebula', 'eye-care', 'cyber-purple'];
+    // WorkDaddy 提供六种外观并共用主题接管；CodeBuddy 提供跟随系统与官方浅色/深色。
+    var ALLOWED_THEMES = (typeof CAPS !== 'undefined' && CAPS.nativeComposer)
+      ? ['system', 'default', 'dark']
+      : ['system', 'default', 'dark', 'nebula', 'eye-care', 'cyber-purple'];
     var currentThemeId = 'default';
     var themeSelectionSerial = 0;
     function syncThemeSelection(id) {
@@ -12041,23 +12408,45 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       });
       syncWallpaperCardVisibility(currentThemeId);
     }
+    function readNativeThemeId() {
+      if (!(typeof CAPS !== 'undefined' && CAPS.nativeComposer)) return null;
+      try {
+        var html = document.documentElement;
+        var body = document.body;
+        var dark = html && (html.getAttribute('data-theme') === 'dark' || html.classList.contains('cb-dark'));
+        dark = dark || body && (body.getAttribute('data-vscode-theme-kind') === 'vscode-dark' || body.getAttribute('data-vscode-theme-name') === 'IDE Night');
+        return dark ? 'dark' : 'default';
+      } catch (_) { return null; }
+    }
     function loadThemes() {
       var serial = themeSelectionSerial;
+      var nativeCurrent = readNativeThemeId();
+      if (nativeCurrent) syncThemeSelection(nativeCurrent);
       return api('/api/themes')
         .then(function (d) {
-          if (serial === themeSelectionSerial) syncThemeSelection(d.current);
+          if (serial === themeSelectionSerial) syncThemeSelection(d.current === 'system' ? 'system' : nativeCurrent || d.current);
         })
         .catch(function () {});
     }
     function selectTheme(id) {
-      if (!sessState.themeTakeover || CAPS.themeTakeover === false || ALLOWED_THEMES.indexOf(id) < 0) return;
+      var nativeTheme = typeof CAPS !== 'undefined' && CAPS.nativeComposer;
+      if (!nativeTheme) {
+        if (!sessState.themeTakeover) return;
+        if (CAPS.themeTakeover === false) return;
+      }
+      if (ALLOWED_THEMES.indexOf(id) < 0) return;
       var previous = currentThemeId;
       var serial = ++themeSelectionSerial;
       syncThemeSelection(id);
-      return applyTheme(id).then(function () {
+      return applyTheme(id).then(function (info) {
         if (serial !== themeSelectionSerial) return;
-        var names = { 'default': '浅色', 'dark': '深色', 'eye-care': '护眼绿', 'cyber-purple': '赛博紫', 'nebula': '毛玻璃' };
-        toast('已应用主题「' + names[id] + '」', false, root);
+        var names = { 'system': '跟随系统', 'default': '浅色', 'dark': '深色', 'eye-care': '护眼绿', 'cyber-purple': '赛博紫', 'nebula': '毛玻璃' };
+        if (id === 'system') {
+          // daemon 返回按系统解析出的具体外观，让用户确认当前落在深色还是浅色
+          toast('已跟随系统，当前使用「' + (info && info.resolved === 'dark' ? '深色' : '浅色') + '」外观', false, root);
+        } else {
+          toast('已应用主题「' + names[id] + '」', false, root);
+        }
       }).catch(function (error) {
         if (serial !== themeSelectionSerial) return;
         syncThemeSelection(previous);
@@ -12069,12 +12458,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       return api('/api/theme-apply', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ id: id }),
+        body: JSON.stringify({ id: id, nativeOnly: typeof CAPS !== 'undefined' && CAPS.nativeComposer }),
       });
     }
     // 壁纸控件仅在毛玻璃下显示；保留默认主题下上传壁纸的兼容目标。
     function themeSelectValue() {
-      return currentThemeId !== 'default' && currentThemeId !== 'dark' ? currentThemeId : 'nebula';
+      return currentThemeId !== 'default' && currentThemeId !== 'dark' && currentThemeId !== 'system' ? currentThemeId : 'nebula';
     }
     // 页面主题由 daemon 在早期注入/加载时恢复；不要延迟 POST 旧主题，
     // 否则旧页面的异步请求可能覆盖用户刚选择的主题。
@@ -12281,6 +12670,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
               if (!d || !d.ok) throw new Error((d && d.error) || '替换背景图失败');
               toast('已添加并应用自定义壁纸', false, root);
               loadThemes();
+              loadWallpaperRotation();
               // 刷新自定义壁纸网格（含选中态）与当前壁纸高亮
               loadWallpapers(true);
             });
@@ -13394,15 +13784,18 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     function acRecordModelRateLimit(snapshot) {
-      if (!snapshot || !snapshot.rateLimited) return;
+      if (!snapshot || !snapshot.rateLimited || Number(snapshot.errorCode) !== 6004) return;
       var modelId = String(snapshot.errorRequestModelId || 'unknown-model').slice(0, 160);
       var code = Number(snapshot.errorCode);
       var signature = [snapshot.conversationId, snapshot.assistantId, modelId, code, snapshot.errorResetAt || ''].join('|');
       if (acRateLimitRecorded[signature]) return;
-      acRateLimitRecorded[signature] = true;
-      if (!acCurrentUidPromise) acCurrentUidPromise = api('/api/current').then(function (current) { return String(current && current.uid || '').trim(); }).catch(function () { return ''; });
+      acRateLimitRecorded[signature] = 'pending';
+      if (!acCurrentUidPromise) acCurrentUidPromise = api('/api/current').then(function (current) {
+        var uid = String(current && current.uid || '').trim();
+        if (!uid) throw new Error('Current account is not ready');
+        return uid;
+      }).catch(function (error) { acCurrentUidPromise = null; throw error; });
       acCurrentUidPromise.then(function (uid) {
-        if (!uid) return;
         return api('/api/model-rate-limit', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -13411,13 +13804,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             modelId: modelId,
             modelName: snapshot.errorModelName || modelId,
             resetAt: snapshot.errorResetAt || null,
-            reasonCode: Number.isSafeInteger(code) ? code : 6004,
+            reasonCode: 6004,
             source: 'renderer-error',
           }),
         }).then(function () {
+          acRateLimitRecorded[signature] = true;
           try { window.dispatchEvent(new Event('workdaddy:accounts-updated')); } catch (_) {}
-        }).catch(function () {});
-      });
+        });
+      }).catch(function () { delete acRateLimitRecorded[signature]; });
     }
 
     function acControllerSnapshot(controller) {
@@ -15480,8 +15874,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           return record && record.modelId;
         }) : [];
         if (!records.length) return;
-        var rawAccountName = String(account.nickname || account.phone || account.uin || account.uid || '未命名账号');
-        var accountName = state.mask ? maskAccountName(rawAccountName) : rawAccountName;
+        var accountName = accountDisplayName(account, state.mask);
         var rows = records.map(function (record) {
           var name = String(record.modelName || record.modelId || '未知模型');
           var reset = record.resetAt ? Number(record.resetAt) : 0;
@@ -16394,8 +16787,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var expired = isIdentityExpired(a);
         var ops = (isCur
           ? ''
-          : (expired || a.authValid === false ? '' : '<button class="wbs-icon-btn wbs-acc-switch" type="button" title="切换" data-uid="' + escAttr(a.uid) + '" data-name="' + escAttr(a.nickname || '未命名') + '">' + SWITCH_SVG + '</button>') +
-            '<button class="wbs-icon-btn wbs-del" type="button" title="删除" data-uid="' + escAttr(a.uid) + '" data-name="' + escAttr(a.nickname || '未命名') + '">' + TRASH_SVG + '</button>');
+          : (expired || a.authValid === false ? '' : '<button class="wbs-icon-btn wbs-acc-switch" type="button" title="切换" data-uid="' + escAttr(a.uid) + '" data-name="' + escAttr(accountDisplayName(a, state.mask)) + '">' + SWITCH_SVG + '</button>') +
+            '<button class="wbs-icon-btn wbs-del" type="button" title="删除" data-uid="' + escAttr(a.uid) + '" data-name="' + escAttr(accountDisplayName(a, state.mask)) + '">' + TRASH_SVG + '</button>');
         ops = '<div class="wbs-ops"' + (isCur ? ' hidden' : '') + '>' + ops + '</div>';
         // 国际版没有手机号：用 UIN（账号唯一数字标识）替代展示；国内版仍显示手机。
         // UIN 与手机号共用同一标签和值间距，确保与“剩余”额度列对齐。
@@ -16403,8 +16796,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var idLbl = a.phone ? '手机' : (a.uin ? 'UIN' : '账号');
         var rawName = a.nickname || '(未命名)';
         var rawId = a.phone ? a.phone : (a.uin ? a.uin : '-');
-        var nameVal = state.mask ? maskAccountName(rawName) : rawName;
-        var idVal = state.mask ? maskAccountId(rawId) : rawId;
+        var nameVal = accountDisplayName(a, state.mask);
+        var idVal = accountDisplayId(a, state.mask);
         card.innerHTML =
           '<div class="wbs-info">' +
           '<div class="wbs-row1"><div class="wbs-name-group"><button type="button" class="wbs-account-name" data-uid="' + escAttr(a.uid) + '" aria-label="查看或编辑账号备注" aria-haspopup="dialog" aria-controls="wbs-account-note-popover" aria-expanded="false"><span class="wbs-name">' + esc(nameVal) + '</span><span class="wbs-account-name-edit" aria-hidden="true">' + MODEL_EDIT_SVG + '</span></button>' + badge + dailyRingsHtml(a) + checkinBadge + modelRateLimitBadge + invalidAuthBadge + '</div>' + ops + '</div>' +
@@ -16453,13 +16846,18 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           })
             .then(function (r) {
               var autoCopy = r && r.autoCopy;
+              var automationSync = r && r.automationSync;
+              var officialAutomationSync = r && r.officialAutomationSync;
+              var automationCopied = (automationSync && automationSync.copied || 0) + (officialAutomationSync && officialAutomationSync.copied || 0);
+              var automationChanged = automationCopied + (officialAutomationSync && officialAutomationSync.updated || 0) + (officialAutomationSync && officialAutomationSync.removed || 0);
+              var automationError = (automationSync && automationSync.error) || (officialAutomationSync && officialAutomationSync.error);
               // 兜底文案优先用 daemon 返回的 hint：codebuddy 走原生会话替换，切换即时生效
               // （无需重启/刷新），"重启后生效"只适用于 WorkBuddy 文件替换且 CDP 刷新失败的场景。
               toast(
-                r.reloaded
-                  ? (autoCopy && autoCopy.jobId ? '已切换为「' + (r.nickname || r.uid) + '」，正在同步已标记会话…' : '已切换为「' + (r.nickname || r.uid) + '」，开始领取积分…')
+                automationError ? '已切换为「' + (r.nickname || r.uid) + '」，' + automationError : r.reloaded
+                  ? (automationChanged ? '已切换为「' + (r.nickname || r.uid) + '」，' + t('已同步定时任务') : autoCopy && autoCopy.jobId ? '已切换为「' + (r.nickname || r.uid) + '」，正在同步已标记会话…' : '已切换为「' + (r.nickname || r.uid) + '」，开始领取积分…')
                   : (r.hint || '已切换为「' + (r.nickname || r.uid) + '」，重启后生效'),
-                false,
+                !!automationError,
                 root
               );
               if (autoCopy && autoCopy.jobId) pollAutoCopyJob(autoCopy.jobId, r.nickname || r.uid);
@@ -16507,6 +16905,28 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       });
     }
 
+    function looksOfficiallyMasked(value) {
+      return /\d{2,4}\*{2,}\d{2,4}/.test(String(value == null ? '' : value).trim());
+    }
+
+    // WorkBuddy may already redact the nickname/phone before it reaches the
+    // backup file. In clear mode there is no original value to reveal, so use
+    // an account-local stable identifier instead of showing the redaction as
+    // if WorkDaddy's own mask were still enabled.
+    function accountDisplayName(account, masked) {
+      account = account || {};
+      var nickname = String(account.nickname || '').trim();
+      if (masked) return maskAccountName(nickname || account.uid || '(未命名)');
+      if (!looksOfficiallyMasked(nickname)) return nickname || account.uid || '(未命名)';
+      return String(account.note || account.phone || account.uid || nickname || '(未命名)');
+    }
+
+    function accountDisplayId(account, masked) {
+      account = account || {};
+      var value = String(account.phone || account.uin || '-').trim();
+      return masked ? maskAccountId(value) : value;
+    }
+
     function maskAccountName(name) {
       var s = String(name == null ? '' : name);
       if (!s.length) return s;
@@ -16543,11 +16963,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         }
         if (!account) continue;
         var nameEl = cards[c].querySelector('.wbs-name');
-        if (nameEl) nameEl.textContent = state.mask ? maskAccountName(account.nickname || '(未命名)') : (account.nickname || '(未命名)');
+        if (nameEl) nameEl.textContent = accountDisplayName(account, state.mask);
         var valEl = cards[c].querySelector('.wbs-phone-cell .wbs-val');
         if (valEl) {
-          var raw = account.phone ? account.phone : (account.uin ? account.uin : '-');
-          valEl.textContent = state.mask ? maskAccountId(raw) : raw;
+          valEl.textContent = accountDisplayId(account, state.mask);
         }
       }
     }
@@ -17226,6 +17645,17 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }
     });
 
+    var modelRateLimitObserver = createModelRateLimitObserver({
+      discover: function () {
+        return CAPS.accounts && WBS_COMPAT && typeof WBS_COMPAT.findConversationControllers === 'function'
+          ? WBS_COMPAT.findConversationControllers(document) : [];
+      },
+      record: acRecordModelRateLimit,
+      setInterval: setBuildInterval,
+      clearInterval: function (timer) { clearInterval(timer); },
+    });
+    registerDisposer(function () { modelRateLimitObserver.destroy(); });
+
     // 注入完成即按开关状态启动/停止监控（不依赖打开增强面板）
     try { ensureAutoContinueMonitor(); } catch (e) {}
     // 注入完成即同步会话模块状态（暂存/快捷短语开关 + 短语列表）并应用到输入框按钮显隐
@@ -17441,6 +17871,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-panel.show{display:flex}',
     '.wbs-root.wbs-panel-light,[data-wbs-appearance="light"]{color-scheme:light;--wb-bg-primary:#fff;--wb-bg-secondary:#fff;--wb-bg-tertiary:#f2f2f2;--wb-bg-popover:#fff;--wb-bg-input:#fff;--wb-bg-hover:#f5f5f5;--wb-bg-active:#eee;--wb-border-subtle:#f0f0f0;--wb-border-default:#e5e5e5;--wb-border-hover:#ccc;--wb-border-strong:#ccc;--wb-color-text-primary:#1f1f1f;--wb-color-text-secondary:#666;--wb-color-text-tertiary:#999;--wb-icon-secondary:#666;--wb-icon-tertiary:#999;--wb-button-primary-bg:#1f1f1f;--wb-button-primary-fg:#fff;--wb-button-primary-bg-hover:#333;--wb-button-primary-bg-disabled:#eee;--wb-button-primary-fg-disabled:#999}',
     '.wbs-panel-light .wbs-panel{background:var(--wb-bg-popover);color:var(--wb-color-text-primary)}',
+    // CodeBuddy 的面板跟随官方浅色/深色；原生深色下必须在根节点同层覆盖
+    // 组件变量，否则宿主的深色文字规则会落在浅色面板上，形成白底浅字。
+    ':is(html.cb-dark,html[data-theme="dark"],body[data-vscode-theme-name*="dark" i],body[data-vscode-theme-name*="night" i]) :is(.wbs-root[data-wbs-profile="codebuddy-cn"],.wbs-root[data-wbs-profile="codebuddy-intl"]){color-scheme:dark;--wb-bg-primary:#0a0a0c;--wb-bg-secondary:#131316;--wb-bg-tertiary:#1b1b20;--wb-bg-popover:#131316;--wb-bg-input:#131316;--wb-bg-hover:color-mix(in srgb,#ffffff 7%,transparent);--wb-bg-active:color-mix(in srgb,#ffffff 10%,transparent);--wb-border-subtle:#202025;--wb-border-default:color-mix(in srgb,#ffffff 13%,transparent);--wb-border-hover:color-mix(in srgb,#ffffff 22%,transparent);--wb-border-strong:#2c2c33;--wb-color-text-primary:#e6e6e9;--wb-color-text-secondary:rgba(230,230,233,.72);--wb-color-text-tertiary:rgba(230,230,233,.55);--wb-icon-secondary:rgba(230,230,233,.72);--wb-icon-tertiary:rgba(230,230,233,.55);--wb-button-primary-bg:rgba(255,255,255,.92);--wb-button-primary-fg:#0a0a0c;--wb-button-primary-bg-hover:rgba(255,255,255,.8);--wb-button-primary-bg-disabled:rgba(230,230,233,.18);--wb-button-primary-fg-disabled:rgba(230,230,233,.42)}',
     // 英文文案更长：英文面板额外加宽，配合 label 自适应避免挤压
     'html[data-wbs-language="en"] .wbs-panel{width:880px}',
     // EN 下固定宽度 label 容易溢出：phone/credit/token 列的 label 释放为自适应宽度
@@ -17449,6 +17882,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // 语言切换 Segmented：复用主题/会话页的分段外观（theme-seg 容器 + sess-seg-btn 按钮）
     '.wbs-language-card .wbs-settings-row{justify-content:space-between}',
     '.wbs-language-card .wbs-pcard-title{margin-bottom:0}',
+    '.wbs-rendering-card .wbs-pcard-title{margin-bottom:0;min-width:0}',
+    '.wbs-rendering-card .wbs-pcard-sub{margin-top:6px;line-height:1.6;color:var(--wb-color-text-secondary);white-space:normal;overflow-wrap:anywhere}',
     '.wbs-lang-seg{flex:0 0 auto;width:auto;margin-bottom:0}',
     '.wbs-lang-seg .wbs-sess-seg-btn{padding:6px 14px}',
     '.wbs-head{display:flex;align-items:center;justify-content:space-between;padding:16px 18px 12px;border-bottom:1px solid var(--wb-border-subtle,#f0f0f0);background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 30%,transparent)}',
@@ -17503,6 +17938,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-credit-tip-value{display:flex;align-items:center;gap:8px;padding:8px 9px;border:1px solid var(--wb-border-subtle,rgba(20,24,32,.1));border-radius:8px;background:color-mix(in srgb,var(--wb-bg-secondary,#f6f7f8) 72%,transparent);color:var(--wb-color-text-primary,#1f1f1f)}.wbs-credit-tip-value i.credit{color:var(--wbs-tip-credit)}.wbs-credit-tip-value b{font-size:12px;font-variant-numeric:tabular-nums}.wbs-credit-tip-value+.wbs-daily-manual{margin-top:11px}',
     '.wbs-daily-popover-empty,.wbs-daily-refresh-error{margin-top:8px;padding-top:8px;border-top:1px solid var(--wb-border-subtle,rgba(20,24,32,.12));color:var(--wb-icon-secondary,#667085);font-size:10.5px;line-height:1.55;overflow-wrap:anywhere}.wbs-daily-refresh-error{color:var(--wb-color-text-secondary,#5f6368)}',
     'html.cb-dark .wbs-status-popover,html[data-theme="dark"] .wbs-status-popover,body[data-vscode-theme-name*="dark" i] .wbs-status-popover{background:color-mix(in srgb,var(--wb-bg-popover,#202126) 88%,transparent);border-color:var(--wb-border-subtle,rgba(255,255,255,.14));color:var(--wb-color-text-primary,#f2f3f5);box-shadow:0 14px 38px rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.08)}',
+    ':is(html.cb-dark,html[data-theme="dark"],body[data-vscode-theme-name*="dark" i],body[data-vscode-theme-name*="night" i]) .wbs-status-popover[data-wbs-profile^="codebuddy-"]{color-scheme:dark;--wb-bg-primary:#0a0a0c;--wb-bg-secondary:#131316;--wb-bg-tertiary:#1b1b20;--wb-bg-popover:#131316;--wb-bg-input:#131316;--wb-bg-hover:color-mix(in srgb,#ffffff 7%,transparent);--wb-bg-active:color-mix(in srgb,#ffffff 10%,transparent);--wb-border-subtle:#202025;--wb-border-default:color-mix(in srgb,#ffffff 13%,transparent);--wb-border-hover:color-mix(in srgb,#ffffff 22%,transparent);--wb-border-strong:#2c2c33;--wb-color-text-primary:#e6e6e9;--wb-color-text-secondary:rgba(230,230,233,.72);--wb-color-text-tertiary:rgba(230,230,233,.55);--wb-icon-secondary:rgba(230,230,233,.72);--wb-icon-tertiary:rgba(230,230,233,.55);--wb-button-primary-bg:rgba(255,255,255,.92);--wb-button-primary-fg:#0a0a0c;--wb-button-primary-bg-hover:rgba(255,255,255,.8);--wb-button-primary-bg-disabled:rgba(230,230,233,.18);--wb-button-primary-fg-disabled:rgba(230,230,233,.42)}',
     '@media (prefers-reduced-motion:reduce){.wbs-daily-rings,.wbs-daily-liquid,.wbs-growth-task-action{transition:none!important}.wbs-daily-cat-mark{animation:none!important}.wbs-daily-refresh-spinner,.wbs-growth-task-action-spinner{animation-duration:1.8s}}',
     '.wbs-meta{display:flex;flex-direction:column;gap:2px}',
     '.wbs-secondary-row{flex-direction:row;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}',
@@ -17969,6 +18405,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     /* 免打扰确认弹窗：挂载在面板容器内，仅覆盖面板区域（弹窗居中于面板，不盖住 WorkBuddy 窗口） */
     '.wbs-modal-mask.wbs-modal-mask-panel{position:absolute;inset:0;z-index:2147483645;border-radius:18px}',
     '.wbs-modal{width:300px;max-width:88vw;background:var(--wb-bg-popover,#fff);border-radius:14px;padding:16px;box-shadow:0 10px 40px rgba(0,0,0,.25);color:var(--wb-color-text-primary,#1f1f1f)}',
+    ':is(html.cb-dark,html[data-theme="dark"],body[data-vscode-theme-name*="dark" i],body[data-vscode-theme-name*="night" i]) :is(.wbs-modal,.wbs-account-note-popover,.wbs-status-popover,.wbs-credit-summary-popover){background:var(--wb-bg-popover,#131316);border-color:var(--wb-border-default,#2c2c33);color:var(--wb-color-text-primary,#e6e6e9)}',
     /* 弹窗文字主题适配：body 继承 .wbs-root 硬编码深色字，暗色下必须显式覆盖为浅色 */
     'html.cb-dark .wbs-modal,html.cb-dark .wbs-modal-title,html.cb-dark .wbs-modal-body,html[data-theme="dark"] .wbs-modal,html[data-theme="dark"] .wbs-modal-title,html[data-theme="dark"] .wbs-modal-body{color:#e6e6e9}',
     'html.cb-dark .wbs-modal-btn:not(:where(.wbs-modal-ok,.primary)),html[data-theme="dark"] .wbs-modal-btn:not(:where(.wbs-modal-ok,.primary)){color:#d5d5d9;border-color:rgba(232,232,234,0.16);background:rgba(255,255,255,0.05)}',
@@ -18080,6 +18517,18 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-update-btn:disabled{opacity:.5;cursor:default}',
     '.wbs-update-progress{display:block;box-sizing:border-box;margin-top:8px;max-height:126px;overflow-y:auto;padding:7px 8px;border:1px solid rgba(226,75,74,.2);border-radius:8px;background:rgba(226,75,74,.045);font-size:10.5px;color:var(--wb-icon-tertiary,#888);line-height:1.5;overflow-wrap:anywhere;scrollbar-width:thin}',
     '.wbs-update-log-line{white-space:normal;word-break:break-word;padding:1px 0}',
+    '.wbs-wallpaper-mode{display:flex;flex-wrap:wrap;gap:8px 18px;margin:10px 0;font-size:12px;color:var(--wb-color-text-primary)}',
+    '.wbs-wallpaper-mode label{display:flex;align-items:center;gap:5px;cursor:pointer}.wbs-wallpaper-mode input{margin:0;accent-color:var(--wb-color-text-primary)}',
+    '#wbs-wallpaper-random[hidden],#wbs-wallpaper-manual[hidden],#wbs-wallpaper-custom-wrap[hidden]{display:none}',
+    '.wbs-wallpaper-label{display:block;margin-bottom:6px;font-size:12px;color:var(--wb-color-text-secondary)}',
+    '.wbs-wallpaper-folder{display:flex;gap:6px;min-width:0;flex-wrap:wrap}.wbs-wallpaper-folder input{flex:1;min-width:100px;width:0}',
+    '.wbs-wallpaper-folder input,.wbs-wallpaper-interval input,.wbs-wallpaper-interval select{box-sizing:border-box;height:28px;padding:4px 7px;border:1px solid var(--wb-border-default);border-radius:7px;background:var(--wb-bg-input);color:var(--wb-color-text-primary);font:inherit;font-size:12px}',
+    '.wbs-wallpaper-button{height:28px;flex-shrink:0;padding:4px 9px;border:1px solid var(--wb-border-default);border-radius:7px;background:var(--wb-bg-secondary);color:var(--wb-color-text-primary);font:inherit;font-size:12px;cursor:pointer;transition:background .15s,border-color .15s}',
+    '.wbs-wallpaper-button:hover{background:var(--wb-bg-hover);border-color:var(--wb-border-hover)}.wbs-wallpaper-button:disabled,#wbs-wallpaper-random input:disabled,#wbs-wallpaper-random select:disabled{opacity:.5;cursor:default}',
+    '.wbs-wallpaper-button:focus-visible,#wbs-wallpaper-random input:focus-visible,#wbs-wallpaper-random select:focus-visible,.wbs-wallpaper-mode input:focus-visible{outline:2px solid var(--wb-accent-blue,var(--wb-color-text-primary));outline-offset:2px}',
+    '.wbs-wallpaper-interval{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-top:10px;font-size:12px;color:var(--wb-color-text-secondary)}.wbs-wallpaper-interval>label:first-child{margin-right:auto}#wbs-wallpaper-custom-wrap{display:flex;align-items:center;gap:5px}#wbs-wallpaper-minutes{width:64px}',
+    '.wbs-wallpaper-actions{display:flex;align-items:center;gap:8px;margin-top:10px;min-width:0}.wbs-wallpaper-status{min-width:0;overflow-wrap:anywhere;font-size:11px;line-height:1.5;color:var(--wb-color-text-secondary)}.wbs-wallpaper-status[data-error="1"]{color:var(--wb-color-text-primary)}',
+    '.wbs-wallpaper-hint{margin-top:8px;font-size:11px;line-height:1.6;overflow-wrap:anywhere;color:var(--wb-color-text-secondary)}',
     /* 官方壁纸网格 */
     '.wbs-wallpapers{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}',
     '.wbs-wp{border-radius:10px;overflow:hidden;cursor:pointer;border:2px solid transparent;transition:all .15s;position:relative}',
@@ -18106,6 +18555,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-theme-seg{display:flex;background:var(--wb-bg-tertiary,#f0f0f0);border-radius:10px;padding:3px;gap:3px;margin-bottom:8px}',
     '.wbs-theme-option{position:relative;text-align:center;line-height:normal}.wbs-theme-option input{position:absolute;opacity:0;width:1px;height:1px}.wbs-theme-option:has(input:focus-visible){outline:2px solid var(--wb-icon-secondary);outline-offset:1px}',
     '.wbs-theme-opt{flex:1;min-width:0;padding:6px 4px;border:none;border-radius:8px;background:transparent;color:var(--wb-icon-secondary,#666);font-size:12px;font-weight:600;cursor:pointer;transition:all .15s;font-family:inherit;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+    '#wbs-theme-seg .wbs-theme-option:has(input[value="system"]){flex:1.5}',
     '.wbs-theme-opt:hover{color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-theme-opt.active{background:var(--wb-button-primary-bg,#1f1f1f);color:var(--wb-button-primary-fg,#fff);box-shadow:0 1px 4px rgba(0,0,0,.2)}',
     /* 背景图来源切换（WorkDaddy 壁纸 / 自定义背景图） */

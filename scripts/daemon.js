@@ -33,6 +33,9 @@ let sessionSync = require('./session-sync.js');
 const {createCodeBuddyFiles} = require('./codebuddy-files.js');
 const { createAccountCreditCache } = require('./account-credit-cache.js');
 const { spawn, spawnSync, execFile } = require('child_process');
+const { createWallpaperRotation, updateWallpaperInRenderer, pickWallpaperDirectory } = require('./wallpaper-rotation');
+const { readClientLaunchSettings, setClientLaunchSettings, getClientLaunchArgs } = require('./client-launch-settings.js');
+const { getWorkBuddyLaunchEnv } = require('./workbuddy-launch-env.js');
 const PROBE_CLIENT_RUNNING = process.argv.includes('--probe-client-running');
 const {
   assertSameProcessIdentity,
@@ -207,6 +210,14 @@ const {
   installBuiltinTask,
   removeBuiltinTasks,
 } = require('./automation.js');
+const {
+  ACCOUNT_SCOPE_KEY: AUTOMATION_ACCOUNT_SCOPE_KEY,
+  readAccountAutomations,
+  readAutomationSyncSettings,
+  writeAutomationSyncSettings,
+  syncAutomationsToAccount,
+  scopeTaskToAccount,
+} = require('./automation-account-sync.js');
 
 const { assertAccountRequestUrl, createTaskState, cancellableWait, createRendererGate, probeSessionReceipt, receiptComplete } = require('./automation-runtime.js');
 const { normalizeAutomationModelId, selectAutomationModel, verifyAutomationModel, restoreNewTaskModelPreference } = require('./automation-model.js');
@@ -218,6 +229,7 @@ const { previewPackage, PACKAGE_FORMAT_VERSION } = require('./automation-package
 const { exportTasks, importTasks, readTransferBody } = require('./automation-transfer.js');
 const { createAutomationDiscovery } = require('./automation-discovery.js');
 const { createAutomationLikesClient } = require('./automation-likes.js');
+const { createOfficialAutomationSync } = require('./official-automation-sync.js');
 
 const { createAutomationNotifier } = require('./toast-options.js');
 const { runCompletionReport, probeAccountCompletion } = require('./completion-report.js');
@@ -499,8 +511,23 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 // 1.2.45：同步功能统一使用 WorkBuddy 的「个性化」名称。
 // 1.2.43：共享身份提示使用全局说明浮层，来源列出未设置账号并简化文案。
 // 1.2.46：合入失效卷上的会话目录修复保护，避免后台反复尝试创建目录。
-const DAEMON_VERSION = '1.2.46';
-const DAEMON_BUILD_ID = 'release-1.2.46-session-cwd-volume-guard';
+// 1.2.47：CodeBuddy 主题页支持切换官方浅色/深色外观。
+// 1.2.48：支持本地文件夹原图随机轮换壁纸，切换时复用主题并释放旧图资源。
+// 1.2.49：换号刷新回退清除旧账号快照；Windows AI 支持持久化软件渲染兼容设置。
+// 1.2.53：账号明文模式避开 WorkBuddy 已脱敏占位值；官方定时任务副本按最近编辑清理。
+// 1.2.54：手机号栏保留 WorkBuddy 官方脱敏手机号，不再误显示 UIN。
+// 1.2.55：官方昵称已脱敏时，账号名称跟随手机号来源，避免 UIN/手机号混用。
+// 1.2.56：从已验证的 access-token preferred_username 恢复官方脱敏手机号。
+// 1.2.57：CodeBuddy CN 成长计划跳转到可操作的 WorkBuddy 成长中心。
+// 1.2.58：官方定时任务按历史关联双向同步修改，保持已保存账号一致。
+// 1.2.59：Windows 两端启动分别固定官方更新源、配置目录和临时缓存，避免串端更新。
+// 1.2.60：自定义安装的 CDP 目标绑定到选定安装目录。
+// 1.2.61：合入跟随系统主题，防止异步检测覆盖后续手动选择。
+// 1.2.62：手动复制会话到当前账号后刷新官方列表，无需再次切号。
+// 1.2.63：跟随系统将浅色恢复视为成功，持续轮询并更新外观基线。
+// 1.2.64：CodeBuddy 原生主题支持跟随系统，重连恢复并与手动选择互斥。
+const DAEMON_VERSION = '1.2.64';
+const DAEMON_BUILD_ID = 'release-1.2.64-codebuddy-system-theme';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({
@@ -1961,8 +1988,10 @@ const cdp = {
   ws: null,
   connected: false,
   port: null,
+  endpointReachable: false,
   targetUrl: null,
   targetTitle: null,
+  targetDescription: null,
   error: null,
   id: 0,
   pending: new Map(),
@@ -2056,6 +2085,7 @@ function runPendingReloadInjection(reason, executionContextId) {
 }
 
 async function findCdpEndpoint() {
+  cdp.endpointReachable = false;
   // profile 已由启动器绑定时不能扫描其他产品的端口；CodeBuddy Agents/Editor
   // 共用 Browser 标识，跨 profile 扫描会把注入发到另一端。
   //
@@ -2075,7 +2105,9 @@ async function findCdpEndpoint() {
       ]);
       const version = await versionRes.json();
       const list = await listRes.json();
-      const targets = Array.isArray(list) ? list : [];
+      if (!version || typeof version.Browser !== 'string' || !Array.isArray(list)) continue;
+      cdp.endpointReachable = true;
+      const targets = list;
       const browserInfo = [version.Browser, version['User-Agent']].filter(Boolean).join(' ');
       const belongsToWorkBuddy = /workbuddy|codebuddy/i.test(browserInfo) || (IS_LINUX && targetsBelongToProfile(targets));
       if (belongsToWorkBuddy && targets.some(isWorkBuddyCdpTarget)) {
@@ -2257,7 +2289,9 @@ async function connectCdp() {
   cdp.port = await findCdpEndpoint();
   if (!cdp.port) {
     cdp.connected = false;
-    cdp.error = '未发现 CDP 端口（WorkBuddy 需以 --remote-debugging-port 启动）';
+    cdp.error = cdp.endpointReachable
+      ? '调试端口可达，但未找到与当前配置匹配的客户端页面，请检查所选客户端路径与 profile 配置'
+      : '未发现 CDP 端口（WorkBuddy 需以 --remote-debugging-port 启动）';
     return false;
   }
   const target = await getPageTarget(cdp.port).catch(() => null);
@@ -2274,6 +2308,7 @@ async function connectCdp() {
       cdp.error = null;
       cdp.targetUrl = target.url || '';
       cdp.targetTitle = target.title || '';
+      cdp.targetDescription = target.description || '';
       // Target ids survive a transient WebSocket reconnect but change with a
       // restarted renderer, unlike the navigation serial missed while offline.
       cdpPageSessionId = String(target.id || target.webSocketDebuggerUrl || 'unknown');
@@ -2356,7 +2391,7 @@ function dispatchAutomationEvent(type, detail = {}) {
     automationEventKeys.add(key);
     while (automationEventKeys.size > 40) automationEventKeys.delete(automationEventKeys.values().next().value);
   }
-  const tasks = readAutomations(DATA_DIR).filter((task) => taskMatchesEvent(task, canonicalType, detail));
+  const tasks = (typeof readCurrentAutomations === 'function' ? readCurrentAutomations() : readAutomations(DATA_DIR)).filter((task) => taskMatchesEvent(task, canonicalType, detail));
   if (!tasks.length) return;
   const account = detail.account || currentAccount();
   tasks.forEach((task) => {
@@ -2667,8 +2702,8 @@ function resetClientDebugState() {
 }
 
 // clientRunning: true=进程在跑 / false=没跑 / null=未知（探测失败时不计数，避免误报）
-function updateClientDebugState({ cdpConnected, clientRunning }) {
-  if (cdpConnected || clientRunning === false) {
+function updateClientDebugState({ cdpConnected, cdpReachable, clientRunning }) {
+  if (cdpConnected || cdpReachable || clientRunning === false) {
     return resetClientDebugState();
   }
   if (clientRunning !== true) return clientDebugState;
@@ -2807,7 +2842,7 @@ async function cdpLoop() {
     // 不静默杀进程；恢复由用户在状态页一键触发（POST /api/client/relaunch）。
     try {
       // clientRunning 已由后台一次性子进程刷新，避免 cdpLoop 周期性阻塞事件循环。
-      updateClientDebugState({ cdpConnected: cdp.connected, clientRunning: clientRunningState.value });
+      updateClientDebugState({ cdpConnected: cdp.connected, cdpReachable: cdp.endpointReachable, clientRunning: clientRunningState.value });
     } catch (e) {
       log(`[cdp] 客户端状态探测异常: ${e.message}`);
     }
@@ -2865,7 +2900,27 @@ async function reloadWorkBuddyPage(options = {}) {
         log('[cdp] 账号快照导航失败，回退页面刷新');
       }
     }
-    if (!navigated) await withTimeout(cdpSend('Page.reload', { ignoreCache: false }), 10000, '刷新 WorkBuddy 页面');
+    if (!navigated) {
+      if (options.account && PROFILE.kind === 'workbuddy') {
+        // profile IPC 可能尚未观察到登录文件变化。直接 reload 会再次 hydrate
+        // URL 内旧账号的身份/套餐；清除快照后由官方正常 getAccount 流程恢复。
+        let cleared = false;
+        try {
+          const result = await withTimeout(cdpSend('Runtime.evaluate', {
+            expression: `(function () {
+              var url = new URL(location.href);
+              url.searchParams.delete('accountSnapshot');
+              history.replaceState(history.state, '', url.href);
+              return !new URL(location.href).searchParams.has('accountSnapshot');
+            })()`,
+            returnByValue: true,
+          }), 10000, '清除旧账号快照');
+          cleared = !!(result && !result.exceptionDetails && result.result && result.result.value === true);
+        } catch (_) {}
+        if (!cleared) throw new Error('无法清除旧账号快照，请重新打开 WorkDaddy 后重试切换');
+      }
+      await withTimeout(cdpSend('Page.reload', { ignoreCache: false }), 10000, '刷新 WorkBuddy 页面');
+    }
     if (options.waitForInjection === false) return true;
     const mounted = await pending.ready;
     if (!mounted) log('[cdp] 页面重载后组件未在 5 秒内确认挂载，继续后台流程');
@@ -3334,14 +3389,16 @@ function relaunchWorkBuddy() {
       }
       // 日志用 ASCII 标记（非用户可见文案，无需进 i18n 词典）
       log(`[logout] 以 ${environmentMode ? '环境变量' : '命令行参数'} CDP=${port} 重启 WorkBuddy: ${command}${viaLauncher ? ' [via launcher]' : ''}`);
-      const childEnv = { ...process.env };
+      const childEnv = getWorkBuddyLaunchEnv(PROFILE, DATA_DIR, process.platform, process.env);
       if (environmentMode) childEnv.WORKBUDDY_REMOTE_DEBUGGING_PORT = String(port);
       if (viaLauncher) {
         // 关键：启动器要用它自己环境的 $HOME 反推真实家目录，必须还原真实 HOME
         const launcherHome = resolveLauncherHome(command);
         if (launcherHome) childEnv.HOME = launcherHome;
       }
-      const child = spawn(command, environmentMode ? [] : [`--remote-debugging-port=${port}`, ...(PROFILE.nativeDebugPort ? [`--inspect=127.0.0.1:${PROFILE.nativeDebugPort}`] : [])], {
+      const args = environmentMode ? [] : [`--remote-debugging-port=${port}`, ...(PROFILE.nativeDebugPort ? [`--inspect=127.0.0.1:${PROFILE.nativeDebugPort}`] : [])];
+      args.push(...getClientLaunchArgs(DATA_DIR, PROFILE.id, process.platform));
+      const child = spawn(command, args, {
         detached: true,
         stdio: 'ignore',
         windowsHide: true,
@@ -3875,12 +3932,23 @@ function automationSwitchAccount(account, options = {}) {
     try {
       if (options.isCancelled && options.isCancelled()) throw new Error('任务已停止');
       const active = currentAccount();
+      const sourceUid = String(active && active.uid || '');
       if (active && active.uid === uid) return { ok: true, uid, switched: false };
       automationSwitchProgress(options, options.restore ? 'restoring-account' : 'switching-account');
       releaseRendererReload = beginRendererReloadPriority();
       await preserveAccountSwitchTheme(uid);
       if (options.isCancelled && options.isCancelled()) throw new Error('任务已停止');
       const acct = await switchAccountForProfile(uid);
+      let automationSync = { enabled: false, copied: 0, skipped: 0, total: 0 };
+      let officialAutomationSync = { enabled: false, copied: 0, skipped: 0, total: 0 };
+      if (sourceUid && sourceUid !== uid && typeof automationSyncEnabled === 'function' && automationSyncEnabled()) {
+        automationSync.enabled = true;
+        try { Object.assign(automationSync, syncAccountAutomations(sourceUid, uid)); }
+        catch (error) { automationSync.error = '定时任务同步失败'; log(`[automation-switch] 定时任务同步失败: ${error.message}`); }
+        officialAutomationSync.enabled = true;
+        try { Object.assign(officialAutomationSync, await syncOfficialAccountAutomations(sourceUid, uid)); }
+        catch (error) { officialAutomationSync.error = '官方定时任务同步失败'; log(`[automation-switch] 官方定时任务同步失败: ${error.message}`); }
+      }
       pendingAutomationAccountSwitch = { account: { uid: acct.uid, nickname: acct.nickname } };
       await reloadWorkBuddyPage({ account: acct });
       if (pendingAutomationAccountSwitch) {
@@ -3888,7 +3956,6 @@ function automationSwitchAccount(account, options = {}) {
         pendingAutomationAccountSwitch = null;
         dispatchAutomationEvent('pageReady', { navigationSerial: mainFrameNavigationSerial, source: 'automation-account-switch', account: switchEvent.account });
       }
-      const sourceUid = String(active && active.uid || '');
       const rules = sourceUid ? getAutoCopyRules(DATA_DIR, sourceUid) : {};
       let job = null;
       if (rules.allSessions || (rules.sessionIds || []).length || (rules.workspaces || []).length) {
@@ -3899,7 +3966,7 @@ function automationSwitchAccount(account, options = {}) {
       releaseRendererReload = null;
       if (job) await waitAutomationSyncJob(job, options);
       if (options.isCancelled && options.isCancelled()) throw new Error('任务已停止');
-      return { ok: true, uid: acct.uid, nickname: acct.nickname, switched: true, syncJobId: job ? job.id : null };
+      return { ok: true, uid: acct.uid, nickname: acct.nickname, switched: true, syncJobId: job ? job.id : null, automationSync, officialAutomationSync };
     } catch (error) {
       pendingAutomationAccountSwitch = null;
       throw error;
@@ -4173,7 +4240,7 @@ function resumeAutomationAfterNavigation(run) {
   const next = run.pendingEvent;
   run.pendingEvent = null;
   if (!next || next.navigationSerial !== mainFrameNavigationSerial || next.pageSessionId !== cdpPageSessionId) return;
-  const task = readAutomations(DATA_DIR).find((item) => item.id === run.taskId && item.enabled && item.trigger.restartOnNavigation);
+  const task = (typeof readCurrentAutomations === 'function' ? readCurrentAutomations() : readAutomations(DATA_DIR)).find((item) => item.id === run.taskId && item.enabled && item.trigger.restartOnNavigation);
   if (task) startAutomationRun(task, next);
 }
 
@@ -4496,11 +4563,11 @@ async function injectWidget(reason, executionContextId) {
   if (!cdp.connected) {
     return Promise.reject(new Error('CDP 未连接，无法注入组件'));
   }
-  // 防御闸：绝不向其他客户端的页面注入。四客户端支持后，未绑定 profile 的旧 daemon
-  // 可能扫到兄弟客户端页面；其余环节（归属判定/清理跳过）已拦截，这里作为最后一道保险。
+  // 防御闸与发现/选页共用归属规则，既隔离兄弟客户端，也尊重自定义安装目录绑定。
   if (cdp.targetUrl) {
-    const cls = classifyTarget(cdp.targetUrl, cdp.targetTitle || '');
-    if (cls && cls !== PROFILE.id) {
+    const target = { type: 'page', url: cdp.targetUrl, title: cdp.targetTitle || '', description: cdp.targetDescription || '' };
+    if (!isTargetForProfile(target, PROFILE)) {
+      const cls = classifyTarget(target.url, target.title, target.description) || 'unknown';
       log(`[cdp] 目标页面属于 ${cls}（当前 profile=${PROFILE.id}），拒绝注入`);
       return Promise.reject(new Error(`目标页面 ${cls} 不属于当前 profile ${PROFILE.id}`));
     }
@@ -4592,6 +4659,7 @@ async function injectWidget(reason, executionContextId) {
         if (reason === 'manual') throw new Error('注入后未检测到 WorkDaddy 组件（请检查 WorkBuddy 页面是否正常加载）');
       } else {
         log(`[cdp] 注入结果确认(${reason}): root=true widget=true url=${state.url}`);
+        if (wallpaperRotation.status().mode === 'random') wallpaperRotation.restore().catch(() => {});
       }
       return { result: r, mounted: Boolean(state && state.root && state.widget), state };
     })
@@ -4737,6 +4805,13 @@ async function writeDiagnosticsSnapshot(reason) {
 // ===== SESSIONS_API_MARK：会话管理（读 WorkBuddy workbuddy.db）=====
 const SESSIONS_DB = PROFILE.sessionDb;
 const SESSION_DB = createSessionDb({ dbPath: SESSIONS_DB });
+const officialAutomationSyncEngine = PROFILE.kind === 'workbuddy'
+  ? createOfficialAutomationSync({
+    dataDir: DATA_DIR,
+    db: SESSION_DB,
+    getAccountUids: () => listAccounts(DATA_DIR).map(account => account.uid),
+  })
+  : null;
 const CODEBUDDY_SESSIONS = PROFILE.kind === 'codebuddy' ? createCodeBuddySessionStore({
   readItems: async () => {
     const items=await codeBuddyNative.sessionItems();
@@ -7607,6 +7682,24 @@ function currentAccount() {
   }
 }
 
+function readCurrentAutomations() {
+  const uid = String((currentAccount() || {}).uid || '').trim();
+  return readAccountAutomations(DATA_DIR, uid);
+}
+
+function automationSyncEnabled() {
+  return readAutomationSyncSettings(DATA_DIR).enabled === true;
+}
+
+function syncAccountAutomations(sourceUid, targetUid) {
+  return syncAutomationsToAccount(DATA_DIR, sourceUid, targetUid);
+}
+
+async function syncOfficialAccountAutomations(sourceUid, targetUid) {
+  if (!officialAutomationSyncEngine) return { copied: 0, skipped: 0, total: 0 };
+  return officialAutomationSyncEngine(sourceUid, targetUid);
+}
+
 function accountBackupFile(uid) {
   const value = String(uid || '').trim();
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
@@ -7777,6 +7870,26 @@ async function waitAiIdle(maxMs = 60000, pollMs = 500, isCancelled = () => false
 const THEMES_DIR = path.join(DATA_DIR, 'themes');
 // 官方背景图库：面板「主题」页的默认壁纸（wallpaper-01.webp ~ wallpaper-NN.webp）
 const WALLPAPERS_DIR = path.join(THEMES_DIR, 'wallpapers');
+const wallpaperRotation = createWallpaperRotation({
+  configFile: path.join(DATA_DIR, 'wallpaper-rotation.json'),
+  isActive: () => !!(PROFILE.capabilities.theme && PROFILE.capabilities.themeTakeover !== false &&
+    cdp.connected && readSessionState().themeTakeoverEnabled !== false && readSavedThemeId() === 'nebula'),
+  invalidate: async () => {
+    if (!cdp.connected) return;
+    try { await cdpSend('Runtime.evaluate', { expression: "if(window.__wbsWallpaperRuntime)window.__wbsWallpaperRuntime.dispose()" }); } catch (_) {}
+  },
+  apply: async (image) => {
+    if (!cdp.connected) return false;
+    const r = await cdpSend('Runtime.evaluate', {
+      expression: '(' + updateWallpaperInRenderer.toString() + ')(' + JSON.stringify({
+        url: `http://${HOST}:${ACTUAL_PORT}/api/wallpaper-rotation/image?key=${image.key}`,
+        token: API_TOKEN,
+      }) + ')', awaitPromise: true, returnByValue: true, timeout: 10000,
+    });
+    return !!(r && r.result && r.result.value === true);
+  },
+});
+
 
 /** 内置资产源目录（首次启动初始化的来源，WorkDaddy.app 自包含打包）：
  * 1) 脚本同目录 builtin/（app 内置模式：Contents/Resources/scripts/builtin）
@@ -8318,18 +8431,104 @@ async function restoreNativeAppearanceByCdp() {
   } catch (_) {}
 }
 
+// 系统设置优先于 renderer matchMedia（官方 nativeTheme 可能已锁定后者）。
+function execCaptureText(cmd, args, timeoutMs = 4000) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { encoding: 'utf8', timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
+      if (err) { err.stderr = stderr; reject(err); } else resolve(String(stdout || ''));
+    });
+  });
+}
+async function resolveSystemThemeByRenderer() {
+  try {
+    const reply = await cdpSend('Runtime.evaluate', {
+      expression: `(function(){try{var m=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)');return m&&m.matches?'dark':'default';}catch(e){return 'default';}})()`,
+      returnByValue: true,
+    });
+    return reply && reply.result && reply.result.value === 'dark' ? 'dark' : 'default';
+  } catch (_) {
+    return 'default';
+  }
+}
+async function resolveSystemTheme() {
+  try {
+    if (process.platform === 'win32') {
+      try {
+        const out = await execCaptureText('reg', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize', '/v', 'AppsUseLightTheme']);
+        const match = out.match(/AppsUseLightTheme\s+REG_DWORD\s+0x([01])\b/i);
+        if (match) return match[1] === '0' ? 'dark' : 'default';
+      } catch (_) {}
+      // reg.exe 不可用（例如被安全软件的程序黑名单拦截、EPERM）时回退 PowerShell 读注册表，
+      // 与 windows-process-boundary 的 powershell 查询同模式，保证受限环境下功能仍可用
+      try {
+        const out = await execCaptureText('powershell', ['-NoProfile', '-Command', "(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize').AppsUseLightTheme"], 8000);
+        if (/^[01]$/.test(String(out).trim())) return String(out).trim() === '0' ? 'dark' : 'default';
+      } catch (_) {}
+      return resolveSystemThemeByRenderer();
+    }
+    if (process.platform === 'darwin') {
+      try {
+        const out = await execCaptureText('defaults', ['read', '-g', 'AppleInterfaceStyle']);
+        if (/^dark$/i.test(out.trim())) return 'dark';
+        if (!out.trim()) return 'default';
+      } catch (error) {
+        // 浅色时键不存在；权限、超时和命令不可用必须继续降级。
+        if (error.code === 1 && /AppleInterfaceStyle[\s\S]*does not exist/i.test(error.stderr || '')) return 'default';
+      }
+      return resolveSystemThemeByRenderer();
+    }
+    const out = (await execCaptureText('gsettings', ['get', 'org.gnome.desktop.interface', 'color-scheme'])).trim();
+    if (/^['"]?prefer-dark['"]?$/.test(out)) return 'dark';
+    if (/^['"]?prefer-light['"]?$/.test(out)) return 'default';
+    return resolveSystemThemeByRenderer();
+  } catch (_) {
+    return resolveSystemThemeByRenderer();
+  }
+}
+
+// 只在 system 模式轮询 OS，不在 renderer 安装会跨 reinjection 残留的监听器。
+let systemThemeTimer = null;
+let systemThemePollInFlight = false;
+let lastResolvedSystemTheme = null;
+function stopSystemThemePolling() {
+  if (systemThemeTimer) { clearInterval(systemThemeTimer); systemThemeTimer = null; }
+}
+function startSystemThemePolling() {
+  if (systemThemeTimer) return;
+  systemThemeTimer = setInterval(async () => {
+    if (systemThemePollInFlight) return;
+    if (!cdp.connected || readSavedThemeId() !== 'system') { stopSystemThemePolling(); return; }
+    const nativeOnly = PROFILE.capabilities.nativeComposer === true;
+    if (!nativeOnly && readSessionState().themeTakeoverEnabled === false) return;
+    systemThemePollInFlight = true;
+    try {
+      await applyThemeByCdp('system', { automatic: true, systemPoll: true, ...(nativeOnly ? { nativeOnly: true } : {}) });
+    } catch (_) {
+      // 不推进基线：下轮重试同一个系统外观。
+    } finally {
+      systemThemePollInFlight = false;
+    }
+  }, 5000);
+  if (typeof systemThemeTimer.unref === 'function') systemThemeTimer.unref();
+}
+
 function readSavedThemeId() {
   try {
     const id = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'current-theme.json'), 'utf8')).id;
-    if (typeof id === 'string' && (id === 'default' || getTheme(id))) return id;
+    if (typeof id === 'string' && (id === 'default' || id === 'system' || getTheme(id))) return id;
   } catch (_) {}
   return 'default';
 }
 
 /** 恢复已保存的主题（CDP 连接/页面刷新后调用）：读取 current-theme.json 重新应用，保证深浅色在重启/刷新后仍生效 */
 async function restoreSavedTheme() {
-  if (!PROFILE.capabilities.theme || PROFILE.capabilities.themeTakeover === false) return;
-  if (!cdp.connected) return;
+  if (!PROFILE.capabilities.theme || !cdp.connected) return;
+  if (PROFILE.capabilities.nativeComposer) {
+    // 原生手动选择由官方保存；system 需 daemon 在重连后继续跟随。
+    if (readSavedThemeId() === 'system') await applyThemeByCdp('system', { automatic: true, nativeOnly: true });
+    return;
+  }
+  if (PROFILE.capabilities.themeTakeover === false) return;
   if (readSessionState().themeTakeoverEnabled === false) {
     // 重载/重连时保留官方选择，不能再次触发关闭开关的一次性浅色重置。
     await startNativeAppearanceSyncByCdp();
@@ -8448,13 +8647,29 @@ function readBackgroundBlur() {
 }
 
 async function applyThemeByCdp(id, options = {}) {
-  if (!PROFILE.capabilities.theme || PROFILE.capabilities.themeTakeover === false) throw new Error(`${PROFILE.name} 暂不支持毛玻璃主题`);
+  const nativeOnly = options.nativeOnly === true || PROFILE.capabilities.nativeComposer === true;
+  if (!PROFILE.capabilities.theme || (PROFILE.capabilities.themeTakeover === false && !nativeOnly)) throw new Error(`${PROFILE.name} 暂不支持毛玻璃主题`);
+  // WorkBuddy's internal nebula transition also uses nativeOnly before
+  // applying its own CSS, so only an explicit non-native profile is rejected.
+  if (nativeOnly && PROFILE.capabilities.nativeComposer === false) throw new Error(`${PROFILE.name} 不支持原生主题切换`);
+  if (nativeOnly && id !== 'default' && id !== 'dark' && id !== 'system') throw new Error(`${PROFILE.name} 仅支持跟随系统、浅色和深色主题`);
   if (options.release && readSessionState().themeTakeoverEnabled !== false) return { applied: false, takeover: true };
-  if (options.automatic && readSessionState().themeTakeoverEnabled === false) return { applied: false, takeover: false };
-  if (!options.automatic && !options.nativeOnly && !options.release) themeApplyGeneration++;
+  if (options.automatic && !nativeOnly && readSessionState().themeTakeoverEnabled === false) return { applied: false, takeover: false };
+  if (!options.automatic && (!options.nativeOnly || PROFILE.capabilities.nativeComposer) && !options.release) {
+    themeApplyGeneration++;
+    stopSystemThemePolling();
+  }
   const applyGeneration = themeApplyGeneration;
   if (!cdp.connected) throw new Error('CDP 未连接');
-  const takeoverEnabled = !options.nativeOnly && readSessionState().themeTakeoverEnabled !== false;
+  const systemMode = id === 'system';
+  if (systemMode) {
+    id = await resolveSystemTheme();
+    // 在第一次 await 之前记录 generation，旧的自动恢复和手动请求均不能覆盖后续选择。
+    if (applyGeneration !== themeApplyGeneration || (!nativeOnly && readSessionState().themeTakeoverEnabled === false) ||
+        (options.systemPoll && readSavedThemeId() !== 'system')) return { applied: false, cancelled: true };
+    if (options.systemPoll && id === lastResolvedSystemTheme) return { applied: false, unchanged: true, system: true, resolved: id };
+  }
+  const takeoverEnabled = !nativeOnly && readSessionState().themeTakeoverEnabled !== false;
   if (id === 'nebula' && takeoverEnabled) {
     // 分开两个 CDP 回合：释放自定义 CSS/守护，让官方深色真正渲染，再接管毛玻璃。
     // 不改持久化接管开关，避免中途失败或并发操作留下错误的用户设置。
@@ -8547,7 +8762,7 @@ async function applyThemeByCdp(id, options = {}) {
           'linear-gradient(rgba(0,0,0,' + mask + '),rgba(0,0,0,' + mask + ')),',
           'linear-gradient(90deg,color-mix(in srgb,var(--wb-bg-primary) 40%,transparent) 0 18%,transparent 42%),',
           'linear-gradient(180deg,transparent 0 58%,color-mix(in srgb,var(--wb-bg-primary) 50%,transparent) 100%),',
-          'url(' + dataUrl + ') right center / cover no-repeat fixed !important;}',
+          'var(--wbs-wallpaper-image,url(' + dataUrl + ')) right center / cover no-repeat fixed !important;}',
           'body[data-vscode-theme-name] .teams-container,body[data-vscode-theme-name] .teams-container.is-mac{background:transparent !important;' + blurCss + '}',
           'body[data-vscode-theme-name] [data-view-id]{background:transparent !important}',
           'body[data-vscode-theme-name] .main-content{background:transparent !important}',
@@ -8566,6 +8781,7 @@ async function applyThemeByCdp(id, options = {}) {
     }
   }
   const expr = `(function(){
+    if (window.__wbsWallpaperRuntime) window.__wbsWallpaperRuntime.dispose();
     var h = document.documentElement, b = document.body;
     if (!h || !b) return { pending: true };
     try {
@@ -8740,8 +8956,8 @@ async function applyThemeByCdp(id, options = {}) {
       wbsSyncNativeTheme(mode);
       return true;
     }
-    if (${takeoverEnabled || options.release || options.nativeOnly ? 'true' : 'false'}) wbsPrepareNativeAppearance(${JSON.stringify(id === 'nebula' || options.nativeOnly ? 'dark' : 'light')});
-    if (${options.release || options.nativeOnly ? 'true' : 'false'}) {
+    if (${takeoverEnabled || options.release || nativeOnly ? 'true' : 'false'}) wbsPrepareNativeAppearance(${JSON.stringify(id === 'nebula' || nativeOnly ? 'dark' : 'light')});
+    if (${options.release || nativeOnly ? 'true' : 'false'}) {
       wbsClearNativeCustomCss();
         // 清掉特殊皮肤缓存；外观快照留给 releaseThemeByCdp 立即恢复。
         try {
@@ -8888,8 +9104,9 @@ async function applyThemeByCdp(id, options = {}) {
       // 重连重试也必须服从后续主题选择或关闭接管，不能把过期阶段重新应用。
       if (applyGeneration !== themeApplyGeneration) return { applied: false, cancelled: true };
       if (options.release && (readSessionState().themeTakeoverEnabled !== false || applyGeneration !== themeApplyGeneration)) return { applied: false, takeover: readSessionState().themeTakeoverEnabled !== false };
-      if (options.automatic && (readSessionState().themeTakeoverEnabled === false || applyGeneration !== themeApplyGeneration)) return { applied: false, takeover: false };
+      if (options.automatic && ((!nativeOnly && readSessionState().themeTakeoverEnabled === false) || applyGeneration !== themeApplyGeneration)) return { applied: false, takeover: false };
       r = await cdpSend('Runtime.evaluate', { expression: expr, returnByValue: true });
+      if (applyGeneration !== themeApplyGeneration) return { applied: false, cancelled: true };
       if (r && r.exceptionDetails) {
         const detail = r.exceptionDetails.exception && r.exceptionDetails.exception.description;
         throw new Error(detail || r.exceptionDetails.text || 'Runtime.evaluate 执行失败');
@@ -8912,7 +9129,16 @@ async function applyThemeByCdp(id, options = {}) {
     log('[theme] 应用主题失败: ' + detail);
     throw new Error('应用主题失败: ' + detail);
   }
-  return { ok: true, applied: v.applied, dark: v.dark, bg: v.bg, text: v.text };
+  if (id === 'nebula' && takeoverEnabled && wallpaperRotation.status().mode === 'random') {
+    wallpaperRotation.restore().catch(() => {});
+  }
+  // 浅色成功恢复官方样式时 applied=false（无自定义覆盖），仍须启动轮询并更新基线。
+  if (systemMode && (v.applied || id === 'default')) {
+    lastResolvedSystemTheme = id;
+    startSystemThemePolling();
+  }
+  return { ok: true, applied: v.applied, dark: v.dark, bg: v.bg, text: v.text,
+    ...(systemMode ? { system: true, resolved: id } : {}) };
 }
 
 /**
@@ -9831,7 +10057,7 @@ function handleApi(req, res) {
 
   if (req.method === 'POST' && p === '/api/automations/export') {
     return readTransferBody(req).then(body => {
-      return exportTasks(readAutomations(DATA_DIR), body && body.ids);
+      return exportTasks(typeof readCurrentAutomations === 'function' ? readCurrentAutomations() : readAutomations(DATA_DIR), body && body.ids);
     }).then(result => json(res, 200, { ok: true, ...result }))
       .catch(error => json(res, 400, { ok: false, error: error.message }));
   }
@@ -9906,10 +10132,20 @@ function handleApi(req, res) {
     });
   }
 
+  if (req.method === 'GET' && p === '/api/automations/auto-sync') {
+    return json(res, 200, { ok: true, enabled: automationSyncEnabled() });
+  }
+  if (req.method === 'POST' && p === '/api/automations/auto-sync') {
+    return readBody(req).then((body) => {
+      if (!body || typeof body.enabled !== 'boolean') return json(res, 400, { ok: false, error: '缺少定时任务同步开关状态' });
+      return json(res, 200, { ok: true, ...writeAutomationSyncSettings(DATA_DIR, body.enabled) });
+    }).catch((error) => json(res, 400, { ok: false, error: error.message }));
+  }
+
   if (req.method === 'GET' && p === '/api/automations') {
     const imported = importAgentInbox(DATA_DIR, { profileId: PROFILE.id });
     imported.forEach((item) => log(`[automation-agent] request=${item.requestId} ${item.ok ? 'imported=' + item.taskId : 'rejected=' + item.error}`));
-    const tasks = readAutomations(DATA_DIR);
+    const tasks = typeof readCurrentAutomations === 'function' ? readCurrentAutomations() : readAutomations(DATA_DIR);
     let builtinMarkers = {};
     try { builtinMarkers = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'automation-builtins.json'), 'utf8')) || {}; } catch (_) {}
     const runs = Array.from(automationRuns.values()).slice(-50).map(automationPublicRun);
@@ -9936,13 +10172,19 @@ function handleApi(req, res) {
       try {
         if (body && body.kind != null) throw new Error('任务包或索引不能作为本地任务执行');
         const task = validateTask(body && body.task ? body.task : body);
-        const tasks = readAutomations(DATA_DIR);
-        const index = tasks.findIndex((item) => item.id === task.id);
-        if (index >= 0 && !isSupportedTaskSchema(tasks[index])) throw new Error('任务使用更新的协议，请升级 WorkDaddy 后再编辑');
-        if (index < 0 && tasks.length >= 200) throw new Error('自动化任务数量已达到上限');
-        if (index >= 0) tasks[index] = task; else tasks.unshift(task);
-        writeAutomations(DATA_DIR, tasks);
-        return json(res, 200, { ok: true, task });
+        const allTasks = readAutomations(DATA_DIR);
+        const currentUid = String((currentAccount() || {}).uid || '').trim();
+        const index = allTasks.findIndex((item) => item.id === task.id && readAccountAutomations(DATA_DIR, currentUid).some((visible) => visible.id === item.id));
+        const sameIdIndex = allTasks.findIndex((item) => item.id === task.id);
+        if (sameIdIndex >= 0 && index < 0) throw new Error('任务 ID 已被其他账号使用');
+        if (index >= 0 && !isSupportedTaskSchema(allTasks[index])) throw new Error('任务使用更新的协议，请升级 WorkDaddy 后再编辑');
+        if (index < 0 && allTasks.length >= 200) throw new Error('自动化任务数量已达到上限');
+        const stored = index >= 0 && allTasks[index][AUTOMATION_ACCOUNT_SCOPE_KEY]
+          ? { ...task, [AUTOMATION_ACCOUNT_SCOPE_KEY]: allTasks[index][AUTOMATION_ACCOUNT_SCOPE_KEY] }
+          : index >= 0 ? task : scopeTaskToAccount(task, currentUid);
+        if (index >= 0) allTasks[index] = stored; else allTasks.unshift(stored);
+        writeAutomations(DATA_DIR, allTasks);
+        return json(res, 200, { ok: true, task: stored });
       } catch (error) { return json(res, 400, { ok: false, error: error.message }); }
     });
   }
@@ -9951,7 +10193,7 @@ function handleApi(req, res) {
     return readBody(req).then((body) => {
       try {
         const id = String(body && body.id || '').trim();
-        const task = readAutomations(DATA_DIR).find((item) => item.id === id);
+        const task = (typeof readCurrentAutomations === 'function' ? readCurrentAutomations() : readAutomations(DATA_DIR)).find((item) => item.id === id);
         if (!task) return json(res, 404, { ok: false, error: '自动化任务不存在' });
         if (!canManuallyRunTask(task)) return json(res, 409, { ok: false, error: '此任务由事件或定时自动触发，无需手动运行' });
         const running = Array.from(automationRuns.values()).find((run) => run.taskId === id && run.status === 'running');
@@ -9966,7 +10208,7 @@ function handleApi(req, res) {
     return readBody(req).then((body) => {
       try {
         const id = String(body && body.id || '').trim();
-        if (!readAutomations(DATA_DIR).some(task => task.id === id)) return json(res, 404, { ok: false, error: '自动化任务不存在' });
+        if (!(typeof readCurrentAutomations === 'function' ? readCurrentAutomations() : readAutomations(DATA_DIR)).some(task => task.id === id)) return json(res, 404, { ok: false, error: '自动化任务不存在' });
         if (Array.from(automationRuns.values()).some(run => run.safetyReviewTaskId === id && run.status === 'running')) {
           return json(res, 409, { ok: false, error: '该任务正在安全评估中' });
         }
@@ -10000,10 +10242,11 @@ function handleApi(req, res) {
         const ids = Array.isArray(body && body.ids) ? body.ids.map((id) => String(id || '').trim()).filter(Boolean).slice(0, 200) : [];
         const action = String(body && body.action || '').trim();
         const tasks = readAutomations(DATA_DIR);
-        const selected = tasks.filter((task) => ids.includes(task.id));
+        const visibleIds = new Set(readCurrentAutomations().map((task) => task.id));
+        const selected = tasks.filter((task) => visibleIds.has(task.id) && ids.includes(task.id));
         if (!selected.length) return json(res, 400, { ok: false, error: '未选择自动化任务' });
         if (action === 'delete') {
-          writeAutomations(DATA_DIR, tasks.filter((task) => !ids.includes(task.id)));
+          writeAutomations(DATA_DIR, tasks.filter((task) => !selected.some((item) => item.id === task.id)));
         } else if (action === 'enable' || action === 'disable') {
           if (selected.some(task => !isTaskCompatible(task))) throw new Error('任务使用更新的协议，请升级 WorkDaddy 后再编辑');
           selected.forEach((task) => { task.enabled = action === 'enable'; task.updatedAt = Date.now(); });
@@ -10012,7 +10255,7 @@ function handleApi(req, res) {
           if (selected.some((task) => !canManuallyRunTask(task))) return json(res, 409, { ok: false, error: '此任务由事件或定时自动触发，无需手动运行' });
           selected.forEach((task) => { if (!Array.from(automationRuns.values()).some((run) => run.taskId === task.id && run.status === 'running')) startAutomationRun(task); });
         } else return json(res, 400, { ok: false, error: '不支持的批量操作' });
-        return json(res, 200, { ok: true, action, count: selected.length, tasks: readAutomations(DATA_DIR) });
+        return json(res, 200, { ok: true, action, count: selected.length, tasks: typeof readCurrentAutomations === 'function' ? readCurrentAutomations() : readAutomations(DATA_DIR) });
       } catch (error) { return json(res, 400, { ok: false, error: error.message }); }
     });
   }
@@ -10363,7 +10606,7 @@ function handleApi(req, res) {
         // 客户端进程是否在跑 / 调试端口是否可达 / 是否命中"更新后丢失调试端口"状态
         // running 由后台定时刷新（refreshClientRunning），请求线程直读缓存，不再同步探测
         running: clientRunningState.value,
-        cdpReachable: cdp.connected,
+        cdpReachable: cdp.connected || cdp.endpointReachable,
         needsDebugRelaunch: clientDebugState.needsDebugRelaunch,
         debugStateUpdatedAt: clientDebugState.updatedAt || null,
       },
@@ -10440,6 +10683,23 @@ function handleApi(req, res) {
         return json(res, 200, { ok: true, enabled, managed: true });
       } catch (e) {
         return json(res, 500, { ok: false, error: '保存遥测设置失败: ' + e.message });
+      }
+    });
+  }
+
+  if (req.method === 'GET' && p === '/api/client-launch-settings') {
+    return json(res, 200, { ok: true, ...readClientLaunchSettings(DATA_DIR, PROFILE.id, process.platform) });
+  }
+
+  if (req.method === 'POST' && p === '/api/client-launch-settings') {
+    return readBody(req).then((body) => {
+      if (process.platform !== 'win32' || PROFILE.id !== 'workbuddy-ai' || !body || typeof body.softwareRendering !== 'boolean') {
+        return json(res, 400, { ok: false, error: '仅 Windows WorkBuddy AI 支持布尔值软件渲染设置' });
+      }
+      try {
+        return json(res, 200, { ok: true, ...setClientLaunchSettings(DATA_DIR, PROFILE.id, body, process.platform) });
+      } catch (_) {
+        return json(res, 500, { ok: false, error: '保存软件渲染设置失败，请重试' });
       }
     });
   }
@@ -10617,7 +10877,7 @@ function handleApi(req, res) {
 
   if (req.method === 'GET' && p === '/api/accounts') {
     const accounts = listAccountsWithRuntimeTokenCache();
-    const checkinAutomationEnabled = readAutomations(DATA_DIR).some(task => task.enabled && stepsContainCheckin(task.steps));
+    const checkinAutomationEnabled = readCurrentAutomations().some(task => task.enabled && stepsContainCheckin(task.steps));
     const cache = loadCheckinCache();
     const today = todayStr();
     return CREDIT_USAGE_STORE.listDailyCheckins(accounts.map((a) => a.uid), today)
@@ -11053,6 +11313,37 @@ function handleApi(req, res) {
       return json(res, 200, { ok: true, themes: listThemes(), current });
     } catch (e) {
       return json(res, 500, { ok: false, error: e.message });
+    }
+  }
+
+  // Rotation routes share the authenticated local API; external paths never
+  // appear in an image URL. Only an issued current/pending ticket can be read.
+  if (p.startsWith('/api/wallpaper-rotation')) {
+    if (!PROFILE.capabilities.theme || PROFILE.capabilities.themeTakeover === false) return json(res, 400, { ok: false, error: '当前客户端不支持壁纸轮换' });
+    if (req.method === 'GET' && p === '/api/wallpaper-rotation') return json(res, 200, { ok: true, ...wallpaperRotation.status() });
+    if (req.method === 'POST' && p === '/api/wallpaper-rotation') {
+      return readBody(req).then(body => wallpaperRotation.configure(body))
+        .then(info => json(res, 200, { ok: true, ...info }))
+        .catch(e => json(res, 400, { ok: false, error: e.message }));
+    }
+    if (req.method === 'POST' && p === '/api/wallpaper-rotation/pick') {
+      return pickWallpaperDirectory().then(directory => json(res, 200, { ok: true, directory, cancelled: !directory }))
+        .catch(e => json(res, 400, { ok: false, error: e.message }));
+    }
+    if (req.method === 'POST' && p === '/api/wallpaper-rotation/next') {
+      return wallpaperRotation.next().then(info => json(res, 200, { ok: true, ...info }));
+    }
+    if (req.method === 'GET' && p === '/api/wallpaper-rotation/image') {
+      return wallpaperRotation.openImage(url.searchParams.get('key')).then(image => {
+        const headers = { 'Content-Type': image.mime, 'Content-Length': image.size, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
+        if (res.__wbsCorsOrigin) { headers['Access-Control-Allow-Origin'] = res.__wbsCorsOrigin; headers.Vary = 'Origin'; }
+        if (res.destroyed) { image.handle.close().catch(() => {}); return; }
+        res.writeHead(200, headers);
+        const stream = image.handle.createReadStream({ start: 0 });
+        res.on('close', () => stream.destroy());
+        stream.on('error', () => res.destroy());
+        stream.pipe(res);
+      }).catch(() => { if (!res.headersSent) json(res, 404, { ok: false, error: '壁纸已失效或不可用' }); });
     }
   }
 
@@ -11718,6 +12009,9 @@ function handleApi(req, res) {
         // reloadIdeWorkbenchWindows 注释）。同步到其他账号无需刷新——切号时
         // session-change 会清缓存。
         if (copied > 0 && targetUid === String((currentAccount() || {}).uid || '')) {
+          // SQLite copies bypass WorkBuddy's collection notifications. Publish
+          // the completed batch before success, as automatic sync already does.
+          await refreshWorkBuddySessionList(targetUid, 'sessions-copy');
           reloadIdeWorkbenchWindows('sessions-copy');
         }
         return json(res, 200, { ok: true, copied, skipped, conflicts, targetUid, warning });
@@ -11912,8 +12206,12 @@ function handleApi(req, res) {
   if (req.method === 'POST' && p === '/api/theme-apply') {
     return readBody(req).then((body) => {
       const id = (body.id || 'default') + '';
-      if (id !== 'default' && !getTheme(id)) return json(res, 404, { ok: false, error: '主题不存在: ' + id });
-      return applyThemeByCdp(id)
+      if (id !== 'default' && id !== 'system' && !getTheme(id)) return json(res, 404, { ok: false, error: '主题不存在: ' + id });
+      const nativeOnly = body.nativeOnly === true && PROFILE.capabilities.nativeComposer && (id === 'default' || id === 'dark' || id === 'system');
+      const applyOptions = nativeOnly ? { nativeOnly: true } : null;
+      const applying = applyOptions ? applyThemeByCdp(id, applyOptions) : applyThemeByCdp(id);
+      const requestGeneration = themeApplyGeneration;
+      return applying
         .then((info) => {
           if (info.cancelled) return json(res, 409, { ok: false, error: '主题切换已被后续操作取消' });
           try {
@@ -11924,6 +12222,11 @@ function handleApi(req, res) {
           return json(res, 200, { ok: true, ...info, id });
         })
         .catch((e) => {
+          // 手动切换失败时仍保留原有 system 模式，并让下轮重试实际外观。
+          if (requestGeneration === themeApplyGeneration && readSavedThemeId() === 'system') {
+            lastResolvedSystemTheme = null;
+            startSystemThemePolling();
+          }
           log('[theme] API 应用失败: ' + e.message);
           return json(res, 500, { ok: false, error: e.message });
         });
@@ -11988,7 +12291,7 @@ function handleApi(req, res) {
   // 注意：CDP 未连接时应用主题会失败，但文件与 current-theme.json 已保存——此时仍返回成功，
   //       由 restoreSavedTheme 在连接恢复后自动应用，避免"背景图已保存但应用失败"的报错困扰用户。
   if (req.method === 'POST' && p === '/api/theme-bg') {
-    return readBody(req).then((body) => {
+    return readBody(req).then(async (body) => {
       try {
         const id = String(body.id || '').replace(/[^A-Za-z0-9_-]/g, '_');
         if (!id) return json(res, 400, { ok: false, error: '缺少 id' });
@@ -12015,6 +12318,7 @@ function handleApi(req, res) {
           buf = Buffer.from(m[2], 'base64');
         }
         if (buf.length > 10 * 1024 * 1024) return json(res, 400, { ok: false, error: '图片不能超过 10MB' });
+        await wallpaperRotation.configure({ mode: 'manual' });
         const dir = path.join(THEMES_DIR, id);
         fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(path.join(dir, 'background.webp'), buf);
@@ -12381,6 +12685,24 @@ function handleApi(req, res) {
         if (sourceUid !== uid) await preserveAccountSwitchTheme(uid);
         const acct = await switchAccountForProfile(uid);
         const hint = acct.nativeSwitched ? '原生登录态已切换，无需重启客户端' : '登录文件已切换，请刷新窗口使新账号生效';
+        let automationSync = { enabled: false, copied: 0, skipped: 0, total: 0 };
+        let officialAutomationSync = { enabled: false, copied: 0, skipped: 0, total: 0 };
+        if (sourceUid && sourceUid !== uid && typeof automationSyncEnabled === 'function' && automationSyncEnabled()) {
+          automationSync.enabled = true;
+          try {
+            Object.assign(automationSync, syncAccountAutomations(sourceUid, uid));
+          } catch (error) {
+            automationSync.error = '定时任务同步失败';
+            log(`[switch] 定时任务同步失败: ${error.message}`);
+          }
+          officialAutomationSync.enabled = true;
+          try {
+            Object.assign(officialAutomationSync, await syncOfficialAccountAutomations(sourceUid, uid));
+          } catch (error) {
+            officialAutomationSync.error = '官方定时任务同步失败';
+            log(`[switch] 官方定时任务同步失败: ${error.message}`);
+          }
+        }
         let reloaded = false;
         if (body.reload) {
           try {
@@ -12426,6 +12748,8 @@ function handleApi(req, res) {
           nickname: acct.nickname,
           reloaded,
           autoCopy: autoCopyJob ? { jobId: autoCopyJob.id, total: autoCopyJob.total, openSessionId: autoCopyJob.openSessionId || '' } : { total: 0 },
+          automationSync,
+          officialAutomationSync,
           hint: reloaded ? '已切换并触发窗口刷新' : hint,
         });
       } catch (e) {
@@ -12611,7 +12935,10 @@ function startServer() {
       // web/ 调试界面已移除（web 目录不再打包），根路径返回自包含的状态提示页
       const c = currentAccount();
       const needRelaunch = clientDebugState.needsDebugRelaunch;
-      const warnBlock = needRelaunch
+      const targetMismatch = !cdp.connected && cdp.endpointReachable;
+      const warnBlock = targetMismatch
+        ? '<p style="max-width:420px;margin:18px auto 0;color:#f0b35e;font-size:13px;line-height:1.6">调试端口可达，但未找到与当前配置匹配的客户端页面。请检查所选客户端路径与 profile 配置。</p>'
+        : needRelaunch
         ? '<div style="max-width:420px;margin:18px auto 0;padding:14px 16px;border:1px solid #7a4a1f;border-radius:10px;background:#2a1c0e;text-align:left">' +
           '<p style="margin:0 0 8px;color:#f0b35e;font-weight:600">⚠ 检测到客户端需要恢复</p>' +
           '<p style="margin:0 0 12px;color:#d8c9b0;font-size:13px;line-height:1.6">WorkBuddy 正在运行，但未以调试模式启动（通常是官方自动更新后自行重启导致），WorkDaddy 无法注入面板。点击下方按钮将以调试模式重启客户端，恢复右下角机器人按钮。</p>' +
@@ -12815,7 +13142,7 @@ setTimeout(() => { migrateAutoCopyTargetRevisionBaselines().catch(() => {}); }, 
 const tickAutomationSchedules = createScheduleTicker(DATA_DIR);
 function runAutomationSchedules() {
   if (PROFILE.capabilities.automations === false) return;
-  tickAutomationSchedules(readAutomations(DATA_DIR), startAutomationRun,
+  tickAutomationSchedules(readCurrentAutomations(), startAutomationRun,
     (id) => Array.from(automationRuns.values()).some((run) => run.taskId === id && run.status === 'running'));
 }
 runAutomationSchedules();
