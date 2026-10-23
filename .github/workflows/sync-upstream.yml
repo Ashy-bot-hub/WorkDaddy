@@ -1,0 +1,23 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "30 1 * * *" # 每天 UTC 01:30 = 北京时间 09:30
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge upstream into main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=main --jq '.merge_type + " -> " + (.merge_commit_sha // "none")'; then
+            echo "Sync OK"
+          else
+            echo "No changes to merge, or merge conflict (manual handling required)"
+          fi
