@@ -32,7 +32,7 @@ function harness() {
     updateCheckinCells() {}, updateCreditCell() {}, fetchActivityForAccounts() {}, toast() {}, root: {},
     MODEL_EDIT_SVG: '', PRIMARY_ACCOUNT_SVG: '', SWITCH_SVG: '', TRASH_SVG: '',
     setBuildTimeout: fn => fn(), setTimeout: () => 1, clearTimeout() {},
-    checkForUpdate() {}, acCheckPromptOnOpen() {}, syncSessionModule() {}, fetchDailyProgressForAccounts() {}, pollActiveSessionCopyNotice() {},
+    checkForUpdate() {}, acCheckPromptOnOpen() {}, syncSessionModule() {}, refreshSessionsSilently() {}, fetchDailyProgressForAccounts() {}, pollActiveSessionCopyNotice() {},
   });
   vm.runInContext([
     section('  function isKnownActivityStreak(', '  function el(tag'),
@@ -178,6 +178,37 @@ test('fresh current-account and identity changes update card controls', () => {
   assert.deepEqual(h.order(), ['a', 'b']);
   assert.notEqual(h.cards()[0], before[0]);
   assert.equal(h.cards()[1].className, 'wbs-card cur');
+});
+
+test('expired identities retain a manual switch while malformed backups remain blocked', () => {
+  const h = harness();
+  h.ctx.render({ accounts: [
+    { ...account('expired', 100), identityExpired: true },
+    { ...account('invalid', 200), authValid: false },
+  ] });
+  assert.match(h.cards()[0].innerHTML, /wbs-acc-switch/);
+  assert.match(h.cards()[0].innerHTML, /可能需要重新登录/);
+  assert.doesNotMatch(h.cards()[1].innerHTML, /wbs-acc-switch/);
+});
+
+test('a background credit expiry response does not hide the manual switch', () => {
+  const button = { style: {} };
+  const credit = { classList: { remove() {} } };
+  const card = {
+    getAttribute: () => 'expired',
+    querySelector: selector => selector === '.wbs-credit-cell' ? credit : button,
+  };
+  const ctx = {
+    state: { accounts: [{ uid: 'expired', creditExpired: true }] },
+    accountsPane: { querySelectorAll: () => [card] },
+    isIdentityExpired: () => true, creditBlockHtml: () => '登录身份过期',
+  };
+  vm.runInNewContext(section('    function updateCreditCell(', '    // ===== 调试'), ctx);
+  ctx.updateCreditCell('expired', null, []);
+  assert.equal(button.style.display, '');
+  ctx.state.accounts[0].authValid = false;
+  ctx.updateCreditCell('expired', null, []);
+  assert.equal(button.style.display, 'none');
 });
 
 test('account metadata refresh retains valid activity days while the server cache is missing or failed', () => {

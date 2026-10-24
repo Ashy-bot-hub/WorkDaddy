@@ -963,7 +963,8 @@ test('session ranges use last-modified time and preserve standard WorkBuddy work
   const inject = read('inject.js');
   assert.match(daemon, /Number\(row\.last_activity_at \?\? row\.updated_at \?\? row\.created_at\) >= rangeMs/);
   assert.match(daemon, /ORDER BY COALESCE\(last_activity_at, updated_at, created_at\) DESC/);
-  assert.match(inject, /sessionsState\.list = \(\(d && d\.sessions\) \|\| \[\]\);/);
+  assert.match(inject, /var nextList = \(d && d\.sessions\) \|\| \[\];/);
+  assert.match(inject, /sessionsState\.list = nextList;/);
   assert.match(inject, /if \(isTaskSessionRecordUI\(s\)\) \{ tasks\.push\(s\); return; \}/);
   assert.match(inject, /fmtHumanTime\(s\.last_activity_at \|\| s\.updated_at \|\| s\.created_at\)/);
 });
@@ -996,9 +997,9 @@ test('account cards keep the compact three-row layout', () => {
   // 账号页暂不展示“发起独立会话保持活跃”入口；daemon 接口保留供内部/后续流程使用。
   assert.doesNotMatch(script, /wbs-growth-activate/);
   assert.doesNotMatch(script, /api\('\/api\/growth\/activate'/);
-  assert.match(script, /expired \|\| a\.authValid === false \? '' : '<button class="wbs-icon-btn wbs-acc-switch"/);
+  assert.match(script, /\(a\.authValid === false \? '' : '<button class="wbs-icon-btn wbs-acc-switch"/);
   assert.match(script, /var invalidAuthBadge = a\.authValid === false/);
-  assert.match(script, /switchBtn\.style\.display = hidden \|\| account\.creditExpired \|\| account\.authValid === false \? 'none' : ''/);
+  assert.match(script, /switchBtn\.style\.display = account\.authValid === false \? 'none' : ''/);
   assert.match(script, /height:5px;min-height:5px/);
   assert.match(script, /\.wbs-credit-segment:first-child\{border-radius:3px 0 0 3px\}/);
   assert.match(script, /\.wbs-credit-segment:last-child\{border-radius:0 3px 3px 0\}/);
