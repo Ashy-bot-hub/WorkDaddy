@@ -1991,6 +1991,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // —— 第十二批：切换/删除断句模板 + ' 天' 时间变体 ——
     ' 天': ' days',
     '已切换到「': 'Switched to “', '再次点击确认切换': 'Click again to confirm switch', '再次点击确认切换为「': 'Click again to confirm switching to “',
+    '切换（可能需要重新登录）': 'Switch (sign-in may be required)',
+    '，可能需要重新登录': '; sign-in may be required',
     '切换中…': 'Switching…', '已切换为「': 'Switched to “', '将永久删除「': 'Permanently delete “', '已永久删除「': 'Permanently deleted “',
     // —— 第十三批：弹窗/登录方式/更新流/会话归档等二级页文案（扫描网修复后暴露）——
     '确定删除这 {n} 条快捷短语吗？删除后不可恢复。': 'Delete these {n} quick phrases? This cannot be undone.',
@@ -8601,7 +8603,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         if (themePane && !themePane.dataset.built) buildThemePane();
         syncWallpaperCardVisibility(currentThemeId);
       }
-      if (name === 'sessions' && sessionsPane && !sessionsPane.dataset.built) buildSessionsPane();
+      if (name === 'sessions' && sessionsPane) {
+        if (!sessionsPane.dataset.built) buildSessionsPane();
+        else refreshSessionsSilently();
+      }
       if (name === 'models' && modelsPane && !modelsPane.dataset.built) buildModelsPane();
       if (name === 'enhance' && enhancePane && !enhancePane.dataset.built) buildEnhancePane();
       if (name === 'automations' && automationPane && !automationPane.dataset.built) buildAutomationPane();
@@ -9393,6 +9398,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       wireSessionsPane();
       loadSessionAccounts();
       loadSessions();
+      setBuildInterval(refreshSessionsSilently, 5000);
       loadAutomationSyncSetting();
       pollActiveSessionCopyJob();
       pollSessionExport();
@@ -9502,31 +9508,68 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }).catch(function () {});
     }
 
-    function loadSessions() {
+    function canRefreshSessions() {
+      return alive && state.open && !document.hidden && sessionsPane && sessionsPane.classList.contains('active') &&
+        !sessionsState.batchMode && !Object.keys(sessionsState.selected || {}).some(function (id) { return sessionsState.selected[id]; }) &&
+        !sessionsState.autoCopyAllBusy && !sessionsState.autoSyncAutomationsBusy &&
+        !(sessionsState.exportJob && sessionsState.exportJob.running) &&
+        !(sessionsState.autoCopyJob && /^(queued|running)$/.test(sessionsState.autoCopyJob.status)) &&
+        !Array.from(root.querySelectorAll('.wbs-modal-mask, .wbs-panel-modal-mask')).some(function (mask) {
+          return !mask.hidden && mask.getClientRects().length > 0;
+        });
+    }
+    function refreshSessionsSilently() {
+      if (!canRefreshSessions() || sessionsState.loading) return;
+      return loadSessions({ silent: true });
+    }
+    function loadSessions(options) {
       if (!sessionsPane) return;
       var listEl = sessionsPane.querySelector('#wbs-sess-list');
       if (!listEl) return;
-      listEl.innerHTML = '<div class="wbs-empty">加载中…</div>';
+      var silent = !!(options && options.silent);
+      if (silent && (!canRefreshSessions() || sessionsState.loading)) return;
+      var snapshot = silent ? JSON.stringify([sessionsState.list, sessionsState.totalBytes, sessionsState.autoCopy, sessionsState.autoCopyAll]) : null;
+      var serial = sessionsState.readSerial = (sessionsState.readSerial || 0) + 1;
+      sessionsState.loading = true;
+      if (!silent) listEl.innerHTML = '<div class="wbs-empty">加载中…</div>';
       // uid: undefined=当前账号(不传)，''=全部账号，具体值=指定账号
       var url = '/api/sessions?range=' + (sessionsState.range || '7d');
       if (sessionsState.uid !== undefined) url += '&uid=' + encodeURIComponent(sessionsState.uid);
-      api(url).then(function (d) {
+      return api(url).then(function (d) {
+        if (!alive || serial !== sessionsState.readSerial || (silent && !canRefreshSessions())) return;
+        // A local rule toggle may finish before this older read returns.
+        if (silent && snapshot !== JSON.stringify([sessionsState.list, sessionsState.totalBytes, sessionsState.autoCopy, sessionsState.autoCopyAll])) return;
+        var nextList = (d && d.sessions) || [];
+        var nextAutoCopy = (d && d.autoCopy) || null;
+        if (silent && snapshot === JSON.stringify([nextList, d && d.totalBytes, nextAutoCopy, !!(d && d.autoCopyAll)])) return;
+        // Capture at response time so scrolling during the request is retained.
+        var listScroll = listEl.scrollTop, bodyScroll = body.scrollTop;
         // 任务会话（is_playground=1）保留在列表中，由渲染层归入「任务」分组展示与操作。
-        sessionsState.list = ((d && d.sessions) || []);
+        sessionsState.list = nextList;
         sessionsState.totalBytes = d && d.totalBytes;
-        sessionsState.autoCopy = (d && d.autoCopy) || null;
+        sessionsState.autoCopy = nextAutoCopy;
         sessionsState.autoCopyAll = !!(d && d.autoCopyAll);
-        sessionsState.selected = {};
-        sessionsState.wsExpanded = {};
+        if (!silent) {
+          sessionsState.selected = {};
+          sessionsState.wsExpanded = {};
+        }
         renderSessions();
+        if (silent) {
+          listEl.scrollTop = listScroll;
+          body.scrollTop = bodyScroll;
+        }
         // 筛选变化后退出批量模式（勾选框隐藏 + 恢复工具栏右侧按钮）
-        if (sessionsState.batchMode) {
+        if (!silent && sessionsState.batchMode) {
           sessionsState.batchMode = false;
           setSessBatchBar(false);
         }
         updateSessCount();
       }).catch(function (e) {
-        listEl.innerHTML = '<div class="wbs-empty">会话加载失败: ' + esc(e.message || e) + '</div>';
+        if (!silent && alive && serial === sessionsState.readSerial) {
+          listEl.innerHTML = '<div class="wbs-empty">会话加载失败: ' + esc(e.message || e) + '</div>';
+        }
+      }).finally(function () {
+        if (serial === sessionsState.readSerial) sessionsState.loading = false;
       });
     }
 
@@ -12079,6 +12122,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }
       fabQuietMode.wake();
       if (open) {
+        if (newlyOpened) refreshSessionsSilently();
         if (newlyOpened && typeof automationPane !== 'undefined' && automationPane && automationPane.__wbsRefreshDiscovery) automationPane.__wbsRefreshDiscovery();
         else if (newlyOpened && typeof preloadAutomationDiscovery === 'function') preloadAutomationDiscovery().catch(function () {});
         if (newlyOpened && !(options && options.automation)) api('/api/automations/events', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'panelOpened' }) }).catch(function () {});
@@ -16778,11 +16822,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var checkinBadge = checkinBadgeHtml(a);
         var modelRateLimitBadge = typeof modelRateLimitBadgeHtml === 'function' ? modelRateLimitBadgeHtml(a) : '';
         var invalidAuthBadge = a.authValid === false ? '<span class="wbs-badge wbs-auth-invalid">认证数据无效</span>' : '';
-        // 当前登录账号隐藏操作；认证已过期的账号保留删除，但隐藏切换，避免进入登录页。
-        var expired = isIdentityExpired(a);
+        // 过期账号仍可手动切换检查登录状态；仅损坏的认证备份禁止切换。
+        var expired = isIdentityExpired(a) || a.creditExpired;
         var ops = (isCur
           ? ''
-          : (expired || a.authValid === false ? '' : '<button class="wbs-icon-btn wbs-acc-switch" type="button" title="切换" data-uid="' + escAttr(a.uid) + '" data-name="' + escAttr(accountDisplayName(a, state.mask)) + '">' + SWITCH_SVG + '</button>') +
+          : (a.authValid === false ? '' : '<button class="wbs-icon-btn wbs-acc-switch" type="button" title="' + (expired ? '切换（可能需要重新登录）' : '切换') + '" data-uid="' + escAttr(a.uid) + '" data-name="' + escAttr(accountDisplayName(a, state.mask)) + '">' + SWITCH_SVG + '</button>') +
             '<button class="wbs-icon-btn wbs-del" type="button" title="删除" data-uid="' + escAttr(a.uid) + '" data-name="' + escAttr(accountDisplayName(a, state.mask)) + '">' + TRASH_SVG + '</button>');
         ops = '<div class="wbs-ops"' + (isCur ? ' hidden' : '') + '>' + ops + '</div>';
         // 国际版没有手机号：用 UIN（账号唯一数字标识）替代展示；国内版仍显示手机。
@@ -16809,18 +16853,22 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       list.querySelectorAll('.wbs-acc-switch').forEach(function (btn) {
         var armed = false;
         var armedTimer = null;
+        var switchTitle = btn.getAttribute('title');
         btn.addEventListener('click', function () {
           if (btn.disabled) return;
           if (!armed) {
             armed = true;
             btn.classList.add('armed');
             btn.setAttribute('title', '再次点击确认切换');
-            toast('再次点击确认切换为「' + btn.dataset.name + '」', false, root);
+            var needsLogin = state.accounts.some(function (a) {
+              return a.uid === btn.dataset.uid && (isIdentityExpired(a) || a.creditExpired);
+            });
+            toast('再次点击确认切换为「' + btn.dataset.name + '」' + (needsLogin ? '，可能需要重新登录' : ''), false, root);
             clearTimeout(armedTimer);
             armedTimer = setBuildTimeout(function () {
               armed = false;
               btn.classList.remove('armed');
-              btn.setAttribute('title', '切换');
+              btn.setAttribute('title', switchTitle);
             }, 3000);
             return;
           }
@@ -16828,7 +16876,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           armed = false;
           btn.classList.remove('armed');
           btn.disabled = true;
-          var prevTitle = btn.getAttribute('title');
+          var prevTitle = switchTitle;
           btn.setAttribute('title', '切换中…');
           api('/api/switch', {
             method: 'POST',
@@ -17237,12 +17285,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           nameGroup.insertAdjacentHTML('beforeend', modelLimitBadge);
         }
         if (cell) {
-          var hidden = isIdentityExpired(account);
           // 不再整格隐藏/清空：过期时由 creditBlockHtml 展示「登录身份过期」诊断文案
           cell.classList.remove('wbs-credit-hidden');
           cell.innerHTML = creditBlockHtml(account.credits, account.creditSegments, account);
           var switchBtn = cards[i].querySelector('.wbs-acc-switch');
-          if (switchBtn) switchBtn.style.display = hidden || account.creditExpired || account.authValid === false ? 'none' : '';
+          if (switchBtn) switchBtn.style.display = account.authValid === false ? 'none' : '';
         }
       }
       updateDailyProgressCells();
@@ -17475,11 +17522,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       for (var j = 0; j < state.accounts.length; j++) {
         if (state.accounts[j].uid === uid) { account = state.accounts[j]; break; }
       }
-      var hidden = isIdentityExpired(account);
       elCredit.classList.remove('wbs-credit-hidden');
       elCredit.innerHTML = creditBlockHtml(credits, segments || [], account);
       var cellSwitch = card.querySelector('.wbs-acc-switch');
-      if (cellSwitch) cellSwitch.style.display = hidden || (account && (account.creditExpired || account.authValid === false)) ? 'none' : '';
+      if (cellSwitch) cellSwitch.style.display = account && account.authValid === false ? 'none' : '';
     }
 
     // ===== 调试：暴露内部状态到 window.__wbsDiag（控制台可调） =====

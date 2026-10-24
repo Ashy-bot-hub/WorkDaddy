@@ -96,8 +96,24 @@ function inspectPersona(options) {
   return { uid: targetUid, status, eligible: ['missing', 'empty', 'bootstrap'].includes(status) && sources.length > 0, sources, revision };
 }
 
+// The configured backup root may be redirected (for example an AppData
+// Junction). Canonicalize that trusted root, including a not-yet-created suffix;
+// paths inside persona still pass through assertSafePath without following links.
+function resolveBackupRoot(backupRoot) {
+  let cursor = path.resolve(backupRoot);
+  const missing = [];
+  for (;;) {
+    try { return path.join(fs.realpathSync(cursor), ...missing); }
+    catch (error) {
+      const parent = path.dirname(cursor);
+      if (error.code !== 'ENOENT' || parent === cursor) throw error;
+      missing.unshift(path.basename(cursor));
+      cursor = parent;
+    }
+  }
+}
 function personaSettingsFile(backupRoot) {
-  const file = path.join(path.resolve(backupRoot), 'persona', 'settings.json');
+  const file = path.join(resolveBackupRoot(backupRoot), 'persona', 'settings.json');
   assertSafePath(file);
   return file;
 }
@@ -127,7 +143,7 @@ function dismissPersonaNotice(backupRoot) {
   return writePersonaSettings(backupRoot, { ...readPersonaSettings(backupRoot), noticeDismissed: true });
 }
 function sharedPersonaDir(backupRoot) {
-  const dir = path.join(path.resolve(backupRoot), 'persona', 'shared');
+  const dir = path.join(resolveBackupRoot(backupRoot), 'persona', 'shared');
   assertSafePath(dir);
   return dir;
 }
@@ -146,7 +162,7 @@ function listPersonaSources({ dataRoot, accounts = [] }) {
   return sources;
 }
 function backupPersonaDirectory(backupRoot, label, original) {
-  const dir = path.join(path.resolve(backupRoot), 'persona', 'backups', label,
+  const dir = path.join(resolveBackupRoot(backupRoot), 'persona', 'backups', label,
     `${Date.now()}-${crypto.randomBytes(6).toString('hex')}`);
   assertSafePath(dir);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -232,10 +248,14 @@ function configurePersona(options) {
 }
 function syncSharedPersonaForSwitch(options) {
   const settings = readPersonaSettings(options.backupRoot);
-  if (settings.mode !== 'shared' || options.sourceUid === options.targetUid) return { skipped: true };
-  if (settings.activeUid !== options.sourceUid) throw new Error('当前账号已变化，请在账号设置中重新选择共享来源');
+  if (settings.mode !== 'shared') return { skipped: true };
+  // The login page has no auth uid. Resume from the last shared projection so
+  // edits made before logout survive, without adopting another logged-in user.
+  const sourceUid = options.sourceUid || settings.activeUid;
+  if (sourceUid === options.targetUid) return { skipped: true };
+  if (settings.activeUid !== sourceUid) throw new Error('当前账号已变化，请在账号设置中重新选择共享来源');
   if (!options.accounts.some(a => String(a.uid) === options.targetUid)) throw new Error('目标账号不存在');
-  const sourceDir = personaDir(options.dataRoot, options.sourceUid);
+  const sourceDir = personaDir(options.dataRoot, sourceUid);
   const files = snapshot(sourceDir);
   return applySharedPersona({ ...options, sourceDir }, files, { ...settings, activeUid: options.targetUid });
 }
@@ -254,7 +274,7 @@ function copyPersona(options) {
   const writes = {};
   for (const name of IDENTITY_FILES) if (nonempty(sourceFiles, name)) writes[name] = sourceFiles[name].text;
   writes['workspace-state.json'] = JSON.stringify(state, null, 2) + '\n';
-  const backupDir = path.join(path.resolve(options.backupRoot), 'persona', options.targetUid, `${Date.now()}-${crypto.randomBytes(6).toString('hex')}`);
+  const backupDir = path.join(resolveBackupRoot(options.backupRoot), 'persona', options.targetUid, `${Date.now()}-${crypto.randomBytes(6).toString('hex')}`);
   assertSafePath(backupDir);
   fs.mkdirSync(backupDir, { recursive: true, mode: 0o700 });
   for (const name of Object.keys(original)) fs.writeFileSync(path.join(backupDir, name), original[name].text, { mode: 0o600, flag: 'wx' });
